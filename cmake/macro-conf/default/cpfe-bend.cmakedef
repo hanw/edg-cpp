@@ -1,0 +1,10 @@
+# Bend-generating back end (external back end, unlowered IL).
+BACK_END_IS_C_GEN_BE=0
+BACK_END_IS_CP_GEN_BE=0
+DO_IL_LOWERING=0
+BACK_END_SHOULD_BE_CALLED=1
+NEED_IL_DISPLAY=1
+# bend_gen_be.c reads the IL in memory, after fe_wrapup.  Keep the memory
+# regions: do not write the IL to a file and free it (debug builds do that
+# by default).
+IL_SHOULD_BE_WRITTEN_TO_FILE=0
