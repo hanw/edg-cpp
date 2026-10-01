@@ -16,7 +16,12 @@ Supported subset (everything else is reported as "not supported"):
               plain structs whose fields have supported types -> Bend Data
               types with one constructor and one accessor def per field.
   functions   free functions defined in the translation unit, with by-value
-              parameters and a non-void result; no overloading, no recursion.
+              parameters and a non-void result (constexpr, const parameters
+              and trailing return types are accepted); no overloading.
+              Recursion: a function may call itself as f(n - 1, ...) where
+              n is its first parameter (unsigned int), n is never assigned,
+              and n is tested against 0 before the call (see "Recursion"
+              below).  Mutual recursion is not supported.
   statements  blocks, local declarations with initializers, assignment to a
               local or a parameter (also to one field of a struct variable,
               and compound assignment), if / if-else, return.
@@ -33,6 +38,9 @@ Translation scheme:
     condition and every live variable, and matches on the condition.  The
     statements after the "if" are copied into both branches, so the helper
     always produces the final result of the function.
+  - "c ? x : y" becomes Bool.pick(T, c, x, y).  In a recursive function, a
+    test of n against 0 (in ?:, &&, || or if) is decided in each case of the
+    match on bend_k, and only the branch that runs is translated.
   - u32 arithmetic is modulo 2^32 in both C++ and Bend.  C++ undefined
     behavior is not modeled: Bend gives a value for x / 0, x % 0 and for
     shifts by 32 or more.
@@ -172,9 +180,11 @@ static void indent(Str *out, int level)
 
 static int         n_errors = 0;
 static const char *cur_function = "";
+static int         quiet = 0;  /* Nonzero during a dry run: no messages. */
 
 static void not_supported(const a_source_position *pos, const char *what)
 {
+  if (quiet) return;
   a_const_char  *file_name = "?";
   a_const_char  *full_name = NULL;
   a_line_number  line = 0;
@@ -195,7 +205,8 @@ static void not_supported(const a_source_position *pos, const char *what)
 static const char *const bend_reserved[] = {
   "match", "case", "def", "type", "law", "for", "exs", "where", "import",
   "as", "do", "return", "is", "Type", "Data", "Kind", "Quant", "True",
-  "False", "Bool", "U32", "Nat", "F32", "List", "Base", "main", NULL
+  "False", "Bool", "U32", "Nat", "F32", "List", "Base", "main",
+  "bend_c", "bend_k", "bend_p", NULL
 };
 
 static const char *safe_name(const char *name)
@@ -293,6 +304,142 @@ static int constant_value(an_expr_node_ptr e, unsigned long long *value)
   return 1;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Recursion.                                                               */
+/*                                                                          */
+/* A recursive function f(n, ...) must have an unsigned int first parameter */
+/* n, must not assign n, must test n against 0 before each recursive call,  */
+/* and each recursive call must be f(n - 1, ...).  It becomes               */
+/*                                                                          */
+/*   def f.go(k: Nat, +n: U32, ...) -> T:    # k is U32.to_nat(n)           */
+/*     match k:                                                             */
+/*       case 0n:   body with every "n == 0" test True                      */
+/*       case 1n+p: body with every "n == 0" test False and                 */
+/*                  each f(n - 1, a...) as f.go(p, U32.sub(n, 1), a...)     */
+/*   def f(+n: U32, ...) -> T:                                              */
+/*     f.go(U32.to_nat(n), n, ...)                                          */
+/*                                                                          */
+/* Bend then checks termination (p is smaller than k).  The translation is  */
+/* exact: k == to_nat(n) holds at the start, and when n != 0,               */
+/* to_nat(n - 1) == to_nat(n) - 1 == p.                                     */
+/* ------------------------------------------------------------------------ */
+
+enum a_zero_state { zs_unknown, zs_zero, zs_nonzero };
+
+struct RecState {
+  a_routine_ptr  self;        /* The function being translated. */
+  a_boolean      dry_run;     /* TRUE while looking for recursive calls. */
+  int            self_calls;  /* Found by the dry run. */
+  a_variable_ptr n;           /* The parameter that counts down. */
+  const char    *go_name;     /* "f.go". */
+  a_zero_state   state;       /* Is n 0 in the case being translated? */
+  int            in_helper;   /* Depth of "if" helper defs. */
+};
+
+static RecState rec = {NULL, FALSE, 0, NULL, NULL, zs_unknown, 0};
+
+/* Functions already translated.  A function may call only these (and
+   itself): Bend needs each def before its use, and has no mutual recursion. */
+static a_routine_ptr *done_routines   = NULL;
+static size_t         n_done_routines = 0;
+static size_t         cap_done        = 0;
+
+static void mark_done(a_routine_ptr r)
+{
+  if (n_done_routines == cap_done) {
+    size_t c = cap_done != 0 ? cap_done * 2 : 32;
+    a_routine_ptr *p = (a_routine_ptr *)realloc(done_routines,
+                                                c * sizeof(a_routine_ptr));
+    if (p == NULL) out_of_memory();
+    done_routines = p;
+    cap_done = c;
+  }  /* if */
+  done_routines[n_done_routines++] = r;
+}
+
+static a_boolean is_done(a_routine_ptr r)
+{
+  for (size_t i = 0; i < n_done_routines; i++) {
+    if (done_routines[i] == r) return TRUE;
+  }  /* for */
+  return FALSE;
+}
+
+static void free_done_routines(void)
+{
+  free(done_routines);
+  done_routines = NULL;
+  n_done_routines = cap_done = 0;
+}
+
+/* Skip parentheses, and casts between 32-bit int and unsigned int (they
+   keep "is zero" and "minus 1").  A cast to a narrower type (for example
+   unsigned char) is not skipped: (unsigned char)n can be 0 when n is not. */
+static an_expr_node_ptr strip(an_expr_node_ptr e)
+{
+  while (e != NULL && e->kind == enk_operation) {
+    an_expr_operator_kind op = e->variant.operation.kind;
+    an_expr_node_ptr a = e->variant.operation.operands;
+    if (op == eok_parens) {
+      e = a;
+    } else if (op == eok_cast && a != NULL &&
+               (kind_of(e->type) == bk_u32 || kind_of(e->type) == bk_int) &&
+               (kind_of(a->type) == bk_u32 || kind_of(a->type) == bk_int)) {
+      e = a;
+    } else {
+      break;
+    }  /* if */
+  }  /* while */
+  return e;
+}
+
+static a_boolean is_rec_n(an_expr_node_ptr e)
+{
+  e = strip(e);
+  return rec.n != NULL && e != NULL && e->kind == enk_variable &&
+         e->variant.variable.ptr == rec.n;
+}
+
+static a_boolean is_const(an_expr_node_ptr e, unsigned long long v)
+{
+  unsigned long long value;
+  return constant_value(strip(e), &value) && value == v;
+}
+
+/* If e compares n with 0 (n == 0, n != 0, n > 0, 0 < n, n <= 0, 0 >= n),
+   return TRUE and set *true_when_zero to the value of e when n is 0. */
+static a_boolean zero_test(an_expr_node_ptr e, a_boolean *true_when_zero)
+{
+  e = strip(e);
+  if (rec.n == NULL || e == NULL || e->kind != enk_operation) return FALSE;
+  an_expr_node_ptr a = e->variant.operation.operands;
+  an_expr_node_ptr b = a != NULL ? a->next : NULL;
+  if (b == NULL) return FALSE;
+  a_boolean n_left = is_rec_n(a) && is_const(b, 0);
+  a_boolean n_right = is_const(a, 0) && is_rec_n(b);
+  if (!n_left && !n_right) return FALSE;
+  switch (e->variant.operation.kind) {
+    case eok_eq: *true_when_zero = TRUE;  return TRUE;
+    case eok_ne: *true_when_zero = FALSE; return TRUE;
+    case eok_gt: if (n_left)  { *true_when_zero = FALSE; return TRUE; } break;
+    case eok_lt: if (n_right) { *true_when_zero = FALSE; return TRUE; } break;
+    case eok_le: if (n_left)  { *true_when_zero = TRUE;  return TRUE; } break;
+    case eok_ge: if (n_right) { *true_when_zero = TRUE;  return TRUE; } break;
+    default: break;
+  }  /* switch */
+  return FALSE;
+}
+
+/* If e is a test of n against 0 and the case being translated fixes its
+   value, return TRUE and set *value. */
+static a_boolean known_zero_test(an_expr_node_ptr e, a_boolean *value)
+{
+  a_boolean true_when_zero;
+  if (rec.state == zs_unknown || !zero_test(e, &true_when_zero)) return FALSE;
+  *value = rec.state == zs_zero ? true_when_zero : !true_when_zero;
+  return TRUE;
+}
+
 /* An int-typed expression whose value comes from bool operands (C++ promotes
    bool to int for ^ & | == !=).  The result is a Bend Bool. */
 static char *tr_boolish(an_expr_node_ptr e)
@@ -374,6 +521,47 @@ static char *tr_call(an_expr_node_ptr e)
     not_supported(&e->position, "a call that is not a direct call");
     return fmt("?");
   }  /* if */
+  if (rec.self != NULL && f->variant.routine.ptr == rec.self) {
+    /* A recursive call. */
+    if (rec.dry_run) {
+      rec.self_calls++;
+      return fmt("?");
+    }  /* if */
+    an_expr_node_ptr first_arg = f->next;
+    an_expr_node_ptr m = strip(first_arg);
+    if (m == NULL || m->kind != enk_operation ||
+        m->variant.operation.kind != eok_subtract ||
+        !is_rec_n(m->variant.operation.operands) ||
+        !is_const(m->variant.operation.operands->next, 1)) {
+      not_supported(&e->position, "a recursive call whose first argument is "
+                                  "not n - 1 (n: the first parameter)");
+      return fmt("?");
+    }  /* if */
+    if (rec.in_helper != 0) {
+      not_supported(&e->position, "a recursive call inside an 'if' that does "
+                                  "not test n against 0 (use ?: instead)");
+      return fmt("?");
+    }  /* if */
+    if (rec.state != zs_nonzero) {
+      not_supported(&e->position, "a recursive call that can run when n is 0 "
+                                  "(test n against 0 first: "
+                                  "n == 0 ? base : f(n - 1, ...))");
+      return fmt("?");
+    }  /* if */
+    Str s = {NULL, 0, 0};
+    s_add(&s, "%s(bend_p, U32.sub(%s, 1)", rec.go_name, var_name(rec.n));
+    for (an_expr_node_ptr arg = first_arg->next; arg != NULL; arg = arg->next) {
+      s_add(&s, ", %s", tr_expr(arg));
+    }  /* for */
+    s_add(&s, ")");
+    return s.p;
+  }  /* if */
+  if (!is_done(f->variant.routine.ptr)) {
+    not_supported(&e->position, fmt("a call to '%s', which is not defined "
+                                    "above this function (mutual recursion "
+                                    "is not supported)",
+                                    f->variant.routine.ptr->source_corresp.name));
+  }  /* if */
   Str s = {NULL, 0, 0};
   s_add(&s, "%s(", safe_name(f->variant.routine.ptr->source_corresp.name));
   int first = 1;
@@ -391,10 +579,25 @@ static char *tr_operation(an_expr_node_ptr e)
   an_expr_node_ptr a = e->variant.operation.operands;
   an_expr_node_ptr b = a != NULL ? a->next : NULL;
   a_bend_kind rk = kind_of(e->type);
+  a_boolean known;
+
+  /* In a recursive function, a test of n against 0 has a known value. */
+  if (rk == bk_bool && known_zero_test(e, &known)) {
+    return fmt(known ? "True{}" : "False{}");
+  }  /* if */
 
   switch (op) {
     case eok_parens:
       return tr_expr(a);
+    case eok_class_rvalue_adjust:
+    case eok_lvalue_adjust:
+      /* A change of cv-qualifiers only (for example "const S x = f();"):
+         the value is the same. */
+      if (rk == kind_of(a->type) &&
+          (rk != bk_struct || skip_typerefs(e->type) == skip_typerefs(a->type))) {
+        return tr_expr(a);
+      }  /* if */
+      break;
     case eok_cast:
     case eok_bool_cast: {
       a_bend_kind ak = kind_of(a->type);
@@ -415,8 +618,12 @@ static char *tr_operation(an_expr_node_ptr e)
       return fmt("?");
     }
     case eok_land:
+      /* C++ does not run b when a is false. */
+      if (known_zero_test(a, &known)) return known ? tr_expr(b) : fmt("False{}");
       return fmt("Bool.and(%s, %s)", tr_expr(a), tr_expr(b));
     case eok_lor:
+      /* C++ does not run b when a is true. */
+      if (known_zero_test(a, &known)) return known ? fmt("True{}") : tr_expr(b);
       return fmt("Bool.or(%s, %s)", tr_expr(a), tr_expr(b));
     case eok_not:
       return fmt("Bool.not(%s)", tr_expr(a));
@@ -462,6 +669,10 @@ static char *tr_operation(an_expr_node_ptr e)
       return tr_call(e);
     case eok_question: {
       an_expr_node_ptr c = b != NULL ? b->next : NULL;
+      if (known_zero_test(a, &known)) {
+        /* Only the branch that runs is translated. */
+        return tr_expr(known ? b : c);
+      }  /* if */
       return fmt("Bool.pick(%s, %s, %s, %s)", bend_type(e->type, &e->position),
                  tr_expr(a), tr_expr(b), tr_expr(c));
     }
@@ -607,6 +818,11 @@ static a_boolean tr_assignment(Str *out, int level, an_expr_node_ptr e,
   }  /* if */
   a_variable_ptr var = target->variant.variable.ptr;
   const char *name = var_name(var);
+  if (rec.n != NULL && var == rec.n) {
+    not_supported(&e->position, "assignment to n, the first parameter of a "
+                                "recursive function");
+    return TRUE;
+  }  /* if */
 
   switch (op) {
     case eok_assign:
@@ -672,6 +888,20 @@ static a_boolean tr_assignment(Str *out, int level, an_expr_node_ptr e,
 static void tr_if(Str *out, int level, a_statement_ptr s, const Cont *k,
                   const Env *env, FnCtx *fc)
 {
+  a_boolean known;
+  if (known_zero_test(s->expr, &known)) {
+    /* A test of n against 0 in a recursive function: only the branch that
+       runs is translated, with no helper def. */
+    Cont rest = {s->next, k};
+    if (known) {
+      tr_seq(out, level, s->variant.if_stmt.then_statement, &rest, *env, fc);
+    } else if (s->variant.if_stmt.else_statement != NULL) {
+      tr_seq(out, level, s->variant.if_stmt.else_statement, &rest, *env, fc);
+    } else {
+      tr_seq(out, level, s->next, k, *env, fc);
+    }  /* if */
+    return;
+  }  /* if */
   int number = ++fc->n_helpers;
   const char *helper = fmt("%s.if%d", fc->name, number);
   Cont rest = {s->next, k};
@@ -685,6 +915,7 @@ static void tr_if(Str *out, int level, a_statement_ptr s, const Cont *k,
   s_add(&h, ") -> %s:\n", fc->result_type);
   s_add(&h, "  match bend_c:\n");
   s_add(&h, "    case True{}:\n");
+  rec.in_helper++;
   tr_seq(&h, 3, s->variant.if_stmt.then_statement, &rest, *env, fc);
   s_add(&h, "    case False{}:\n");
   if (s->variant.if_stmt.else_statement != NULL) {
@@ -692,6 +923,7 @@ static void tr_if(Str *out, int level, a_statement_ptr s, const Cont *k,
   } else {
     tr_seq(&h, 3, s->next, k, *env, fc);
   }  /* if */
+  rec.in_helper--;
   s_add(&h, "\n");
   s_add(&fc->helpers, "%s", s_get(&h));
 
@@ -810,26 +1042,74 @@ static void gen_routine(Str *out, a_routine_ptr rout)
   fc.result_type = bend_type(rtype, pos);
 
   a_scope_ptr scope = scope_for_routine(rout);
+  a_variable_ptr params = scope->variant.routine.parameters;
   Env env;
   env.n = 0;
-  Str head = {NULL, 0, 0};
-  s_add(&head, "def %s(", fc.name);
-  int first = 1;
-  for (a_variable_ptr p = scope->variant.routine.parameters; p != NULL;
-       p = p->next) {
-    s_add(&head, "%s+%s: %s", first ? "" : ", ", var_name(p),
+  Str plist = {NULL, 0, 0};   /* "+a: T, +b: U" */
+  Str alist = {NULL, 0, 0};   /* "a, b" */
+  for (a_variable_ptr p = params; p != NULL; p = p->next) {
+    s_add(&plist, "%s+%s: %s", p == params ? "" : ", ", var_name(p),
           bend_type(p->type, pos));
+    s_add(&alist, "%s%s", p == params ? "" : ", ", var_name(p));
     env_bind(&env, var_name(p), p->type);
-    first = 0;
   }  /* for */
-  s_add(&head, ") -> %s:\n", fc.result_type);
 
-  Str body = {NULL, 0, 0};
-  tr_seq(&body, 1, scope->assoc_block, NULL, env, &fc);
+  /* Dry run: does the function call itself? */
+  rec.self = rout;
+  rec.dry_run = TRUE;
+  rec.self_calls = 0;
+  {
+    FnCtx dry = fc;
+    Str scratch = {NULL, 0, 0};
+    dry.helpers.p = NULL;
+    dry.helpers.n = dry.helpers.cap = 0;
+    quiet++;
+    tr_seq(&scratch, 1, scope->assoc_block, NULL, env, &dry);
+    quiet--;
+  }
+  rec.dry_run = FALSE;
+
+  if (rec.self_calls == 0) {
+    rec.self = NULL;
+    Str body = {NULL, 0, 0};
+    tr_seq(&body, 1, scope->assoc_block, NULL, env, &fc);
+    s_add(out, "%s", s_get(&fc.helpers));
+    s_add(out, "# C++: %s\n", rout->source_corresp.name);
+    s_add(out, "def %s(%s) -> %s:\n%s\n", fc.name, s_get(&plist),
+          fc.result_type, s_get(&body));
+    return;
+  }  /* if */
+
+  /* A recursive function: count down on the first parameter. */
+  if (params == NULL || kind_of(params->type) != bk_u32) {
+    not_supported(pos, "a recursive function whose first parameter is not "
+                       "unsigned int");
+    rec.self = NULL;
+    return;
+  }  /* if */
+  rec.n = params;
+  rec.go_name = fmt("%s.go", fc.name);
+  Str case0 = {NULL, 0, 0};
+  Str case1 = {NULL, 0, 0};
+  rec.state = zs_zero;
+  tr_seq(&case0, 3, scope->assoc_block, NULL, env, &fc);
+  rec.state = zs_nonzero;
+  tr_seq(&case1, 3, scope->assoc_block, NULL, env, &fc);
+  rec.state = zs_unknown;
 
   s_add(out, "%s", s_get(&fc.helpers));
-  s_add(out, "# C++: %s\n", rout->source_corresp.name);
-  s_add(out, "%s%s\n", s_get(&head), s_get(&body));
+  s_add(out, "# C++: %s (recursive: bend_k counts down with %s)\n",
+        rout->source_corresp.name, var_name(params));
+  s_add(out, "def %s(+bend_k: Nat, %s) -> %s:\n", rec.go_name, s_get(&plist),
+        fc.result_type);
+  s_add(out, "  match bend_k:\n    case 0n:\n%s    case 1n+bend_p:\n%s\n",
+        s_get(&case0), s_get(&case1));
+  s_add(out, "def %s(%s) -> %s:\n  %s(U32.to_nat(%s), %s)\n\n", fc.name,
+        s_get(&plist), fc.result_type, rec.go_name, var_name(params),
+        s_get(&alist));
+  rec.self = NULL;
+  rec.n = NULL;
+  rec.go_name = NULL;
 }
 
 static a_boolean is_user_struct(a_type_ptr type)
@@ -873,6 +1153,7 @@ translation unit has been processed.  The IL is not lowered.
       }  /* if */
     }  /* for */
     gen_routine(&out, r);
+    mark_done(r);
   }  /* for */
 
   const char *out_name = getenv("EDG_BEND_OUT");
@@ -882,12 +1163,14 @@ translation unit has been processed.  The IL is not lowered.
     if (f == NULL) {
       fprintf(stderr, "bend back end: cannot open %s\n", out_name);
       free_all_bufs();
+      free_done_routines();
       exit(1);
     }  /* if */
   }  /* if */
   fputs(s_get(&out), f);
   if (f != stdout) fclose(f);
   free_all_bufs();
+  free_done_routines();
   cur_function = "";
   if (n_errors != 0) {
     fprintf(stderr, "bend back end: %d construct(s) not supported; the Bend "
