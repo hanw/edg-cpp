@@ -45,6 +45,11 @@ Translation scheme:
     behavior is not modeled: Bend gives a value for x / 0, x % 0 and for
     shifts by 32 or more.
 
+Laws in C++: a function named law_<name> that returns bool states "for all
+values of its parameters, it returns true".  If EDG_BEND_LAWS_OUT names a
+file, each such function also becomes "law <name>" in that file, which
+imports the code file (EDG_BEND_OUT, in the same directory) as C.
+
 The output goes to the file named by the EDG_BEND_OUT environment variable
 (standard output if it is not set).  If any construct is not supported, the
 messages go to standard error and the program exits with status 1.
@@ -788,6 +793,23 @@ struct FnCtx {
 static void tr_seq(Str *out, int level, a_statement_ptr s, const Cont *k,
                    Env env, FnCtx *fc);
 
+/* Write the let "+name = value".  A value that is a bare struct constructor
+   "S{...}" gets a type, "+name : S = S{...}": Bend cannot infer the type of
+   a constructor alone. */
+static void emit_let(Str *out, const char *name, const char *value,
+                     a_type_ptr type)
+{
+  if (kind_of(type) == bk_struct) {
+    const char *sname = struct_name(type);
+    size_t n = strlen(sname);
+    if (strncmp(value, sname, n) == 0 && value[n] == '{') {
+      s_add(out, "+%s : %s = %s\n", name, sname, value);
+      return;
+    }  /* if */
+  }  /* if */
+  s_add(out, "+%s = %s\n", name, value);
+}
+
 /* Translate an assignment statement into a Bend let.  Return FALSE if the
    expression is not an assignment. */
 static a_boolean tr_assignment(Str *out, int level, an_expr_node_ptr e,
@@ -880,7 +902,7 @@ static a_boolean tr_assignment(Str *out, int level, an_expr_node_ptr e,
     value = s.p;
   }  /* if */
   indent(out, level);
-  s_add(out, "+%s = %s\n", name, value);
+  emit_let(out, name, value, var->type);
   env_bind(env, name, var->type);
   return TRUE;
 }
@@ -956,7 +978,8 @@ static void tr_seq(Str *out, int level, a_statement_ptr s, const Cont *k,
         const char *name = var_name(di->variable);
         (void)bend_type(di->variable->type, &s->position);
         indent(out, level);
-        s_add(out, "+%s = %s\n", name, tr_dynamic_init(di, &s->position));
+        emit_let(out, name, tr_dynamic_init(di, &s->position),
+                 di->variable->type);
         env_bind(&env, name, di->variable->type);
         break;
       }
@@ -1112,6 +1135,81 @@ static void gen_routine(Str *out, a_routine_ptr rout)
   rec.go_name = NULL;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Laws.                                                                    */
+/*                                                                          */
+/* A function whose name starts with "law_" and that returns bool is a law: */
+/* "for all values of the parameters, the function returns true".  It is   */
+/* translated like any other function, and it also gives                    */
+/*                                                                          */
+/*   law <name without law_>:                                               */
+/*     for +a: T                                                            */
+/*     ...                                                                  */
+/*     {C.law_<name>(a, ...) == True{} : Bool}                              */
+/*                                                                          */
+/* in the laws file (EDG_BEND_LAWS_OUT), which imports the code file as C.  */
+/* ------------------------------------------------------------------------ */
+
+static const char LAW_PREFIX[] = "law_";
+
+static a_boolean is_law(a_routine_ptr rout)
+{
+  const char *name = rout->source_corresp.name;
+  return name != NULL &&
+         strncmp(name, LAW_PREFIX, sizeof(LAW_PREFIX) - 1) == 0 &&
+         name[sizeof(LAW_PREFIX) - 1] != '\0';
+}
+
+static void gen_law(Str *laws, a_routine_ptr rout)
+{
+  const char *name = safe_name(rout->source_corresp.name);
+  a_source_position *pos = &rout->source_corresp.decl_position;
+  cur_function = name;
+  a_type_ptr rtype = skip_typerefs(rout->type)->variant.routine.return_type;
+  if (kind_of(rtype) != bk_bool) {
+    not_supported(pos, "a law function (name law_...) that does not return "
+                       "bool");
+    return;
+  }  /* if */
+  a_scope_ptr scope = scope_for_routine(rout);
+  s_add(laws, "# C++: %s\nlaw %s:\n", rout->source_corresp.name,
+        rout->source_corresp.name + sizeof(LAW_PREFIX) - 1);
+  Str args = {NULL, 0, 0};
+  for (a_variable_ptr p = scope->variant.routine.parameters; p != NULL;
+       p = p->next) {
+    s_add(laws, "  for +%s: %s%s\n", var_name(p),
+          kind_of(p->type) == bk_struct ? "C." : "", bend_type(p->type, pos));
+    s_add(&args, "%s%s", args.n == 0 ? "" : ", ", var_name(p));
+  }  /* for */
+  s_add(laws, "  {C.%s(%s) == True{} : Bool}\n\n", name, s_get(&args));
+}
+
+/* The last part of a path: "dir/x.bend" -> "x.bend". */
+static const char *base_name(const char *path)
+{
+  const char *b = path;
+  for (const char *p = path; *p != '\0'; p++) {
+    if (*p == '/' || *p == '\\') b = p + 1;
+  }  /* for */
+  return b;
+}
+
+static void write_file(const char *name, const Str *text)
+{
+  FILE *f = stdout;
+  if (name != NULL && name[0] != '\0') {
+    f = fopen(name, "w");
+    if (f == NULL) {
+      fprintf(stderr, "bend back end: cannot open %s\n", name);
+      free_all_bufs();
+      free_done_routines();
+      exit(1);
+    }  /* if */
+  }  /* if */
+  fputs(s_get(text), f);
+  if (f != stdout) fclose(f);
+}
+
 static a_boolean is_user_struct(a_type_ptr type)
 {
   return (type->kind == tk_struct || type->kind == tk_class) &&
@@ -1130,6 +1228,8 @@ translation unit has been processed.  The IL is not lowered.
 */
 {
   Str out = {NULL, 0, 0};
+  Str laws = {NULL, 0, 0};
+  int n_laws = 0;
   a_scope_ptr file_scope = il_header.primary_scope;
 
   s_add(&out, "# Generated by EDG cpfe-bend from %s.\n",
@@ -1154,21 +1254,39 @@ translation unit has been processed.  The IL is not lowered.
     }  /* for */
     gen_routine(&out, r);
     mark_done(r);
+    if (is_law(r)) {
+      gen_law(&laws, r);
+      n_laws++;
+    }  /* if */
   }  /* for */
 
   const char *out_name = getenv("EDG_BEND_OUT");
-  FILE *f = stdout;
-  if (out_name != NULL && out_name[0] != '\0') {
-    f = fopen(out_name, "w");
-    if (f == NULL) {
-      fprintf(stderr, "bend back end: cannot open %s\n", out_name);
-      free_all_bufs();
-      free_done_routines();
-      exit(1);
+  const char *laws_name = getenv("EDG_BEND_LAWS_OUT");
+  write_file(out_name, &out);
+  if (laws_name != NULL && laws_name[0] != '\0') {
+    if (out_name == NULL || out_name[0] == '\0') {
+      fprintf(stderr, "bend back end: EDG_BEND_LAWS_OUT needs EDG_BEND_OUT "
+                      "(the laws file imports the code file)\n");
+      n_errors++;
+    } else {
+      Str lf = {NULL, 0, 0};
+      s_add(&lf, "# Generated by EDG cpfe-bend from the law_ functions in "
+                 "%s.\n",
+            il_header.primary_source_file != NULL ?
+              il_header.primary_source_file->file_name : "?");
+      s_add(&lf, "# Do not edit: write the laws in C++ and run the "
+                 "translation again.\n");
+      s_add(&lf, "# Each law: for all inputs, the C++ law function returns "
+                 "true.\n\n");
+      s_add(&lf, "import Base\nimport ./%s as C\n\n%s", base_name(out_name),
+            s_get(&laws));
+      if (n_laws == 0) {
+        fprintf(stderr, "bend back end: no law_ functions found\n");
+        n_errors++;
+      }  /* if */
+      write_file(laws_name, &lf);
     }  /* if */
   }  /* if */
-  fputs(s_get(&out), f);
-  if (f != stdout) fclose(f);
   free_all_bufs();
   free_done_routines();
   cur_function = "";
