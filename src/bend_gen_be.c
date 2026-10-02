@@ -298,6 +298,8 @@ static void env_bind(Env *env, const char *name, a_type_ptr type)
 
 static char *tr_expr(an_expr_node_ptr e);
 static char *tr_constant(a_constant_ptr cp, const a_source_position *pos);
+static char *tr_dynamic_init(a_dynamic_init_ptr di,
+                             const a_source_position *pos);
 
 static int constant_value(an_expr_node_ptr e, unsigned long long *value)
 {
@@ -702,11 +704,18 @@ static char *tr_expr(an_expr_node_ptr e)
       return tr_constant(e->variant.constant.ptr, &e->position);
     case enk_operation:
       return tr_operation(e);
+    case enk_temp_init:
+      /* A temporary, for example the result of f() in "f().x": its value
+         is the value of its initializer. */
+      if (e->variant.init.dynamic_init != NULL) {
+        return tr_dynamic_init(e->variant.init.dynamic_init, &e->position);
+      }  /* if */
+      break;
     default:
-      not_supported(&e->position, fmt("expression kind number %d",
-                                      (int)e->kind));
-      return fmt("?");
+      break;
   }  /* switch */
+  not_supported(&e->position, fmt("expression kind number %d", (int)e->kind));
+  return fmt("?");
 }
 
 static char *tr_dynamic_init(a_dynamic_init_ptr di,
