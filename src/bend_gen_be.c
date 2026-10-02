@@ -47,10 +47,12 @@ Translation scheme:
 
 Primitives: entities in namespace "bend" (cpp-bend include/bend_mem.h) are
 not translated; they have a fixed Bend meaning.  bend::Mem (a read-only u32
-array) becomes the Data type Mem of a prelude that is written into the
+array) and bend::Ram (a u32 memory that can be written) become the Data
+type Mem of a prelude that is written into the
 output when it is used: a tree on the bits of the index, so that a law with
-a Mem parameter is a law for every array content.  bend::load(m, i) becomes
-Mem.load(m, i).
+a Mem parameter is a law for every array content.  bend::load(m, i) and
+bend::ram_load(m, i) become Mem.load(m, i); bend::ram_store(m, i, v) becomes
+Mem.store(m, i, v), a new memory.
 
 Laws in C++: a function named law_<name> that returns bool states "for all
 values of its parameters, it returns true".  If EDG_BEND_LAWS_OUT names a
@@ -270,7 +272,26 @@ static const char MEM_PRELUDE[] =
   "def Mem.load(+m: Mem, +i: U32) -> U32:\n"
   "  match i:\n"
   "    case U32{w}:\n"
-  "      Mem.load.go(32n, m, w)\n\n";
+  "      Mem.load.go(32n, m, w)\n\n"
+  "def Mem.store.go(n: Nat, m: Mem, w: Word(n), v: U32) -> Mem:\n"
+  "  match n:\n"
+  "    case 0n:\n"
+  "      MemLeaf{v}\n"
+  "    case 1n+p:\n"
+  "      match m w:\n"
+  "        case MemLeaf{+x} WCon{False{}, t}:\n"
+  "          MemNode{Mem.store.go(p, MemLeaf{x}, t, v), MemLeaf{x}}\n"
+  "        case MemLeaf{+x} WCon{True{}, t}:\n"
+  "          MemNode{MemLeaf{x}, Mem.store.go(p, MemLeaf{x}, t, v)}\n"
+  "        case MemNode{l, r} WCon{False{}, t}:\n"
+  "          MemNode{Mem.store.go(p, l, t, v), r}\n"
+  "        case MemNode{l, r} WCon{True{}, t}:\n"
+  "          MemNode{l, Mem.store.go(p, r, t, v)}\n\n"
+  "# C++: bend::ram_store(m, i, v): a new memory with v at i\n"
+  "def Mem.store(+m: Mem, +i: U32, +v: U32) -> Mem:\n"
+  "  match i:\n"
+  "    case U32{w}:\n"
+  "      Mem.store.go(32n, m, w, v)\n\n";
 
 enum a_bend_kind { bk_bool, bk_u32, bk_int, bk_struct, bk_other };
 
@@ -293,11 +314,12 @@ static const char *struct_name(a_type_ptr type)
   a_type_ptr t = skip_typerefs(type);
   if (in_bend_ns(t->source_corresp.parent_scope)) {
     if (t->source_corresp.name != NULL &&
-        strcmp(t->source_corresp.name, "Mem") == 0) {
+        (strcmp(t->source_corresp.name, "Mem") == 0 ||
+         strcmp(t->source_corresp.name, "Ram") == 0)) {
       uses_mem = 1;
       return "Mem";
     }  /* if */
-    not_supported(NULL, "a type in namespace bend other than bend::Mem");
+    not_supported(NULL, "a type in namespace bend other than bend::Mem and bend::Ram");
     return "?";
   }  /* if */
   return safe_name(t->source_corresp.name);
@@ -624,14 +646,20 @@ static char *tr_call(an_expr_node_ptr e)
   }  /* if */
   if (in_bend_ns(f->variant.routine.ptr->source_corresp.parent_scope)) {
     const char *nm = f->variant.routine.ptr->source_corresp.name;
-    if (nm == NULL || strcmp(nm, "load") != 0) {
+    const char *bn = NULL;
+    if (nm != NULL && (strcmp(nm, "load") == 0 || strcmp(nm, "ram_load") == 0)) {
+      bn = "Mem.load";
+    } else if (nm != NULL && strcmp(nm, "ram_store") == 0) {
+      bn = "Mem.store";
+    }  /* if */
+    if (bn == NULL) {
       not_supported(&e->position, "a function in namespace bend other than "
-                                  "bend::load");
+                                  "load, ram_load and ram_store");
       return fmt("?");
     }  /* if */
     uses_mem = 1;
     Str s = {NULL, 0, 0};
-    s_add(&s, "Mem.load(");
+    s_add(&s, "%s(", bn);
     int first = 1;
     for (an_expr_node_ptr arg = f->next; arg != NULL; arg = arg->next) {
       s_add(&s, "%s%s", first ? "" : ", ", tr_expr(arg));
