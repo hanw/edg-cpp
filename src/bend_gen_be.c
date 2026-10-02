@@ -45,6 +45,13 @@ Translation scheme:
     behavior is not modeled: Bend gives a value for x / 0, x % 0 and for
     shifts by 32 or more.
 
+Primitives: entities in namespace "bend" (cpp-bend include/bend_mem.h) are
+not translated; they have a fixed Bend meaning.  bend::Mem (a read-only u32
+array) becomes the Data type Mem of a prelude that is written into the
+output when it is used: a tree on the bits of the index, so that a law with
+a Mem parameter is a law for every array content.  bend::load(m, i) becomes
+Mem.load(m, i).
+
 Laws in C++: a function named law_<name> that returns bool states "for all
 values of its parameters, it returns true".  If EDG_BEND_LAWS_OUT names a
 file, each such function also becomes "law <name>" in that file, which
@@ -223,6 +230,48 @@ static const char *safe_name(const char *name)
   return name;
 }
 
+/* Entities in namespace "bend" (include/bend_mem.h) are primitives with a
+   fixed Bend meaning: bend::Mem is the type Mem of the prelude, and
+   bend::load(m, i) is Mem.load(m, i).  Their C++ bodies are not translated. */
+static int uses_mem = 0;
+
+static a_boolean in_bend_ns(a_scope_ptr s)
+{
+  return s != NULL && s->kind == sck_namespace &&
+         s->variant.assoc_namespace != NULL &&
+         s->variant.assoc_namespace->source_corresp.name != NULL &&
+         strcmp(s->variant.assoc_namespace->source_corresp.name, "bend") == 0;
+}
+
+static const char MEM_PRELUDE[] =
+  "# bend::Mem (include/bend_mem.h): a read-only array of unsigned int.\n"
+  "# Here it is a tree on the bits of the index (bit 0 first), so a law\n"
+  "# with a Mem parameter holds for every function from U32 to U32.\n"
+  "type Mem is Data:\n"
+  "  MemLeaf{v: U32}\n"
+  "  MemNode{l: Mem, r: Mem}\n\n"
+  "def Mem.load.go(n: Nat, m: Mem, w: Word(n)) -> U32:\n"
+  "  match n:\n"
+  "    case 0n:\n"
+  "      match m:\n"
+  "        case MemLeaf{v}:\n"
+  "          v\n"
+  "        case MemNode{l, r}:\n"
+  "          0\n"
+  "    case 1n+p:\n"
+  "      match m w:\n"
+  "        case MemLeaf{v} WCon{b, t}:\n"
+  "          v\n"
+  "        case MemNode{l, r} WCon{False{}, t}:\n"
+  "          Mem.load.go(p, l, t)\n"
+  "        case MemNode{l, r} WCon{True{}, t}:\n"
+  "          Mem.load.go(p, r, t)\n\n"
+  "# C++: bend::load(m, i), that is m.p[i]\n"
+  "def Mem.load(+m: Mem, +i: U32) -> U32:\n"
+  "  match i:\n"
+  "    case U32{w}:\n"
+  "      Mem.load.go(32n, m, w)\n\n";
+
 enum a_bend_kind { bk_bool, bk_u32, bk_int, bk_struct, bk_other };
 
 static a_bend_kind kind_of(a_type_ptr type)
@@ -241,7 +290,17 @@ static a_bend_kind kind_of(a_type_ptr type)
 
 static const char *struct_name(a_type_ptr type)
 {
-  return safe_name(skip_typerefs(type)->source_corresp.name);
+  a_type_ptr t = skip_typerefs(type);
+  if (in_bend_ns(t->source_corresp.parent_scope)) {
+    if (t->source_corresp.name != NULL &&
+        strcmp(t->source_corresp.name, "Mem") == 0) {
+      uses_mem = 1;
+      return "Mem";
+    }  /* if */
+    not_supported(NULL, "a type in namespace bend other than bend::Mem");
+    return "?";
+  }  /* if */
+  return safe_name(t->source_corresp.name);
 }
 
 static const char *bend_type(a_type_ptr type, const a_source_position *pos)
@@ -559,6 +618,24 @@ static char *tr_call(an_expr_node_ptr e)
     s_add(&s, "%s(bend_p, U32.sub(%s, 1)", rec.go_name, var_name(rec.n));
     for (an_expr_node_ptr arg = first_arg->next; arg != NULL; arg = arg->next) {
       s_add(&s, ", %s", tr_expr(arg));
+    }  /* for */
+    s_add(&s, ")");
+    return s.p;
+  }  /* if */
+  if (in_bend_ns(f->variant.routine.ptr->source_corresp.parent_scope)) {
+    const char *nm = f->variant.routine.ptr->source_corresp.name;
+    if (nm == NULL || strcmp(nm, "load") != 0) {
+      not_supported(&e->position, "a function in namespace bend other than "
+                                  "bend::load");
+      return fmt("?");
+    }  /* if */
+    uses_mem = 1;
+    Str s = {NULL, 0, 0};
+    s_add(&s, "Mem.load(");
+    int first = 1;
+    for (an_expr_node_ptr arg = f->next; arg != NULL; arg = arg->next) {
+      s_add(&s, "%s%s", first ? "" : ", ", tr_expr(arg));
+      first = 0;
     }  /* for */
     s_add(&s, ")");
     return s.p;
@@ -1245,6 +1322,9 @@ translation unit has been processed.  The IL is not lowered.
         il_header.primary_source_file != NULL ?
           il_header.primary_source_file->file_name : "?");
   s_add(&out, "# Do not edit: run the translation again.\n\nimport Base\n\n");
+  Str head = out;            /* The prelude goes after the head. */
+  out.p = NULL;
+  out.n = out.cap = 0;
 
   for (a_type_ptr t = file_scope->types; t != NULL; t = t->next) {
     if (is_user_struct(t)) gen_struct(&out, t);
@@ -1269,6 +1349,12 @@ translation unit has been processed.  The IL is not lowered.
     }  /* if */
   }  /* for */
 
+  {
+    Str all = {NULL, 0, 0};
+    s_add(&all, "%s%s%s", s_get(&head), uses_mem ? MEM_PRELUDE : "",
+          s_get(&out));
+    out = all;
+  }
   const char *out_name = getenv("EDG_BEND_OUT");
   const char *laws_name = getenv("EDG_BEND_LAWS_OUT");
   write_file(out_name, &out);
