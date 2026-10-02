@@ -806,6 +806,15 @@ static char *tr_expr(an_expr_node_ptr e)
     case enk_variable:
       return fmt("%s", var_name(e->variant.variable.ptr));
     case enk_constant:
+      /* A bool call of a constexpr function that the front end has
+         evaluated (for example a law with no parameters): translate the
+         call, not its value, so that Bend does the evaluation and checks
+         it.  Numbers stay folded. */
+      if (e->variant.constant.ptr->is_result_of_constexpr_call &&
+          e->variant.constant.ptr->expr != NULL &&
+          kind_of(e->variant.constant.ptr->type) == bk_bool) {
+        return tr_expr(e->variant.constant.ptr->expr);
+      }  /* if */
       return tr_constant(e->variant.constant.ptr, &e->position);
     case enk_operation:
       return tr_operation(e);
