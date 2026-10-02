@@ -893,6 +893,16 @@ static void emit_let(Str *out, const char *name, const char *value,
       return;
     }  /* if */
   }  /* if */
+  if (kind_of(type) == bk_u32 && value[0] >= '0' && value[0] <= '9') {
+    /* A number alone: Bend cannot infer its type. */
+    s_add(out, "+%s : U32 = %s\n", name, value);
+    return;
+  }  /* if */
+  if (kind_of(type) == bk_bool &&
+      (strcmp(value, "True{}") == 0 || strcmp(value, "False{}") == 0)) {
+    s_add(out, "+%s : Bool = %s\n", name, value);
+    return;
+  }  /* if */
   s_add(out, "+%s = %s\n", name, value);
 }
 
