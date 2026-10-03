@@ -1231,6 +1231,176 @@ static a_boolean is_user_struct(a_type_ptr type)
          type->variant.class_struct_union.field_list != NULL;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Data: the constant values of variables, as JSON (EDG_DATA_OUT).          */
+/* ------------------------------------------------------------------------ */
+
+/* With EDG_DATA_OUT set, the back end also writes the value of each
+   variable at namespace scope (not in namespace std) that EDG initializes
+   statically, as JSON: {"ns::name": value, ...}.  EDG evaluates the
+   initializer (designated initializers, default member initializers,
+   constexpr constructors); the value is the object that results.  A struct
+   is an object with its field names, an array is a list, an integer or a
+   bool is a number.  This reads data that a compiler writes as C++ (for
+   example a table of tiling parameters) without a parser of our own. */
+
+static int n_data_errors = 0;
+
+static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type);
+
+static void dump_zero(Str *s, a_type_ptr type)
+{
+  a_type_ptr t = skip_typerefs(type);
+  if (t->kind == tk_struct || t->kind == tk_class) {
+    s_add(s, "{");
+    int first = 1;
+    for (a_field_ptr f = t->variant.class_struct_union.field_list; f != NULL;
+         f = f->next) {
+      s_add(s, "%s\"%s\": ", first ? "" : ", ",
+            f->source_corresp.name != NULL ? f->source_corresp.name : "?");
+      dump_zero(s, f->type);
+      first = 0;
+    }  /* for */
+    s_add(s, "}");
+  } else if (t->kind == tk_array) {
+    s_add(s, "[");
+    unsigned long n = (unsigned long)t->variant.array.variant.number_of_elements;
+    for (unsigned long i = 0; i < n; i++) {
+      if (i != 0) s_add(s, ", ");
+      dump_zero(s, t->variant.array.element_type);
+    }  /* for */
+    s_add(s, "]");
+  } else {
+    s_add(s, "0");
+  }  /* if */
+}
+
+static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
+{
+  a_type_ptr t = skip_typerefs(type);
+  switch (cp->kind) {
+    case ck_integer: {
+      a_boolean ovflo = FALSE;
+      if (int_constant_is_signed(cp)) {
+        s_add(s, "%lld", (long long)value_of_integer_constant(cp, &ovflo));
+      } else {
+        s_add(s, "%llu",
+              (unsigned long long)unsigned_value_of_integer_constant(cp, &ovflo));
+      }  /* if */
+      return;
+    }
+    case ck_aggregate: {
+      /* The constants in order, with ck_designator entries that move the
+         current field or element, and ck_init_repeat entries. */
+      a_constant_ptr c = cp->variant.aggregate.first_constant;
+      if (t->kind == tk_struct || t->kind == tk_class) {
+        int nf = count_fields(t), k = 0;
+        a_constant_ptr *val = (a_constant_ptr *)calloc((size_t)(nf + 1),
+                                                       sizeof(a_constant_ptr));
+        a_field_ptr f = t->variant.class_struct_union.field_list;
+        if (val == NULL) out_of_memory();
+        for (; c != NULL; c = c->next) {
+          if (c->kind == ck_designator) {
+            k = 0;
+            for (f = t->variant.class_struct_union.field_list;
+                 f != NULL && f != c->variant.designator.variant.field;
+                 f = f->next) k++;
+            continue;
+          }  /* if */
+          if (k < nf) val[k] = c;
+          k++;
+          if (f != NULL) f = f->next;
+        }  /* for */
+        s_add(s, "{");
+        k = 0;
+        for (f = t->variant.class_struct_union.field_list; f != NULL;
+             f = f->next, k++) {
+          s_add(s, "%s\"%s\": ", k == 0 ? "" : ", ",
+                f->source_corresp.name != NULL ? f->source_corresp.name : "?");
+          if (val[k] != NULL) dump_constant(s, val[k], f->type);
+          else dump_zero(s, f->type);
+        }  /* for */
+        s_add(s, "}");
+        free(val);
+        return;
+      }  /* if */
+      if (t->kind == tk_array) {
+        a_type_ptr et = t->variant.array.element_type;
+        unsigned long n = (unsigned long)t->variant.array.variant.number_of_elements;
+        unsigned long i = 0;
+        a_constant_ptr *val = (a_constant_ptr *)calloc((size_t)n + 1,
+                                                       sizeof(a_constant_ptr));
+        if (val == NULL) out_of_memory();
+        for (; c != NULL; c = c->next) {
+          if (c->kind == ck_designator) {
+            i = (unsigned long)c->variant.designator.variant.array_element;
+          } else if (c->kind == ck_init_repeat) {
+            for (unsigned long r = 0;
+                 r < (unsigned long)c->variant.init_repeat.count && i < n;
+                 r++, i++) {
+              val[i] = c->variant.init_repeat.constant;
+            }  /* for */
+          } else {
+            if (i < n) val[i] = c;
+            i++;
+          }  /* if */
+        }  /* for */
+        s_add(s, "[");
+        for (i = 0; i < n; i++) {
+          if (i != 0) s_add(s, ", ");
+          if (val[i] != NULL) dump_constant(s, val[i], et);
+          else dump_zero(s, et);
+        }  /* for */
+        s_add(s, "]");
+        free(val);
+        return;
+      }  /* if */
+      break;
+    }
+    default:
+      break;
+  }  /* switch */
+  fprintf(stderr, "lean back end: data: a constant of kind %d is not "
+                  "written (null)\n", (int)cp->kind);
+  n_data_errors++;
+  s_add(s, "null");
+}
+
+static void dump_scope(Str *s, a_scope_ptr scope, const char *prefix,
+                       int *first)
+{
+  for (a_variable_ptr v = scope->variables; v != NULL; v = v->next) {
+    if (v->source_corresp.name == NULL) continue;
+    if (v->init_kind != initk_static || v->initializer.constant == NULL) {
+      fprintf(stderr, "lean back end: data: %s%s is not initialized statically "
+                      "(init kind %d); not written\n", prefix,
+              v->source_corresp.name, (int)v->init_kind);
+      n_data_errors++;
+      continue;
+    }  /* if */
+    s_add(s, "%s\n  \"%s%s\": ", *first ? "" : ",", prefix,
+          v->source_corresp.name);
+    dump_constant(s, v->initializer.constant, v->type);
+    *first = 0;
+  }  /* for */
+  for (a_namespace_ptr n = scope->namespaces; n != NULL; n = n->next) {
+    if (n->is_namespace_alias || n->is_std || n->source_corresp.name == NULL)
+      continue;
+    dump_scope(s, n->variant.assoc_scope,
+               fmt("%s%s::", prefix, n->source_corresp.name), first);
+  }  /* for */
+}
+
+static void dump_data(const char *name)
+{
+  Str s = {NULL, 0, 0};
+  int first = 1;
+  s_add(&s, "{");
+  dump_scope(&s, il_header.primary_scope, "", &first);
+  s_add(&s, "\n}\n");
+  write_file(name, &s);
+}
+
 }  /* namespace lean_gen */
 
 using namespace lean_gen;
@@ -1247,6 +1417,22 @@ translation unit has been processed.  The IL is not lowered.
   a_scope_ptr file_scope = il_header.primary_scope;
   const char *src = il_header.primary_source_file != NULL ?
                       il_header.primary_source_file->file_name : "?";
+  const char *data_name = getenv("EDG_DATA_OUT");
+
+  if (data_name != NULL && data_name[0] != '\0') {
+    /* Data only (see dump_data); no Lean output unless EDG_LEAN_OUT is set. */
+    dump_data(data_name);
+    const char *lean_name = getenv("EDG_LEAN_OUT");
+    if (lean_name == NULL || lean_name[0] == '\0') {
+      free_all_bufs();
+      if (n_data_errors != 0) {
+        fprintf(stderr, "lean back end: data: %d value(s) not written\n",
+                n_data_errors);
+        exit(1);
+      }  /* if */
+      return;
+    }  /* if */
+  }  /* if */
 
   for (a_type_ptr t = file_scope->types; t != NULL; t = t->next) {
     if (is_user_struct(t)) gen_struct(&out, t);
