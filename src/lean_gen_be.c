@@ -8,8 +8,7 @@ SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 /*
 lean_gen_be.c -- A back end that translates the (unlowered) EDG IL of a small
 C++ subset into Lean 4 source code, so that Lean theorems and proofs can be
-written about the C++ functions.  It accepts the same subset as the Bend back
-end (bend_gen_be.c) and translates it the same way, with Lean syntax.
+written about the C++ functions.
 
 Supported subset (everything else is reported as "not supported"):
 
@@ -36,22 +35,22 @@ Translation scheme:
     becomes "bif c then ... else ...", and the statements after the "if" are
     copied into both branches.  "c ? x : y" becomes "bif c then x else y".
   - A recursive function f(n, ...) becomes
-      def f.go (bend_k : Nat) (n : U32) ... : T :=
-        match bend_k with
+      def f.go (fuel : Nat) (n : U32) ... : T :=
+        match fuel with
         | 0 => (body with each test of n against 0 decided: n is 0)
-        | bend_p + 1 => (body with n not 0; f(n - 1, a...) is
-                         f.go bend_p (n - 1) a...)
+        | fuel' + 1 => (body with n not 0; f(n - 1, a...) is
+                         f.go fuel' (n - 1) a...)
       def f (n : U32) ... : T := f.go n.toNat n ...
-    Lean checks the structural recursion on bend_k.  The translation is
-    exact: bend_k = n.toNat at the start, and when n != 0,
-    (n - 1).toNat = n.toNat - 1 = bend_p.
+    Lean checks the structural recursion on fuel.  The translation is
+    exact: fuel = n.toNat at the start, and when n != 0,
+    (n - 1).toNat = n.toNat - 1 = fuel'.
   - C++ undefined behavior is not modeled: Lean gives a value for x / 0,
     x % 0 and for shifts by 32 or more.
 
-Primitives: bend::Mem and bend::Ram (cpp-bend include/bend_mem.h) become the
+Primitives: lean::Mem and lean::Ram (cpp-lean include/lean_mem.h) become the
 structure Mem of a prelude: a function from U32 to U32, so a theorem about a
-Mem parameter is about every array content.  bend::load(m, i) and
-bend::ram_load(m, i) are Mem.load m i; bend::ram_store(m, i, v) is
+Mem parameter is about every array content.  lean::load(m, i) and
+lean::ram_load(m, i) are Mem.load m i; lean::ram_store(m, i, v) is
 Mem.store m i v, a new memory.
 
 Laws in C++: a function named law_<name> that returns bool states "for all
@@ -231,7 +230,7 @@ static const char *const lean_reserved[] = {
   "nomatch", "nofun", "bif", "sorry", "suffices", "obtain", "U32", "Mem",
   "min", "max", "not", "and", "or", "xor", "id", "pure", "cond", "ite",
   "get", "load", "store", "toNat",
-  "Nat", "Bool", "BitVec", "C", "Laws", "bend_k", "bend_p", NULL
+  "Nat", "Bool", "BitVec", "C", "Laws", "fuel", NULL
 };
 
 static const char *safe_name(const char *name)
@@ -243,34 +242,34 @@ static const char *safe_name(const char *name)
   return name;
 }
 
-/* Entities in namespace "bend" (include/bend_mem.h) are primitives with a
-   fixed Bend meaning: bend::Mem is the type Mem of the prelude, and
-   bend::load(m, i) is Mem.load(m, i).  Their C++ bodies are not translated. */
+/* Entities in namespace "lean" (include/lean_mem.h) are primitives with a
+   fixed Lean meaning: lean::Mem is the type Mem of the prelude, and
+   lean::load(m, i) is Mem.load m i.  Their C++ bodies are not translated. */
 static int uses_mem = 0;
 
-static a_boolean in_bend_ns(a_scope_ptr s)
+static a_boolean in_lean_ns(a_scope_ptr s)
 {
   return s != NULL && s->kind == sck_namespace &&
          s->variant.assoc_namespace != NULL &&
          s->variant.assoc_namespace->source_corresp.name != NULL &&
-         strcmp(s->variant.assoc_namespace->source_corresp.name, "bend") == 0;
+         strcmp(s->variant.assoc_namespace->source_corresp.name, "lean") == 0;
 }
 
 static const char MEM_PRELUDE[] =
-  "/-- bend::Mem and bend::Ram (include/bend_mem.h): an array of unsigned\n"
+  "/-- lean::Mem and lean::Ram (include/lean_mem.h): an array of unsigned\n"
   "int.  Here it is any function from U32 to U32, so a theorem with a Mem\n"
   "parameter holds for every array content. -/\n"
   "structure Mem where\n"
   "  get : U32 -> U32\n\n"
-  "/-- C++: bend::load(m, i), that is m.p[i] -/\n"
+  "/-- C++: lean::load(m, i), that is m.p[i] -/\n"
   "def Mem.load (m : Mem) (i : U32) : U32 := m.get i\n\n"
-  "/-- C++: bend::ram_store(m, i, v): a new memory with v at i -/\n"
+  "/-- C++: lean::ram_store(m, i, v): a new memory with v at i -/\n"
   "def Mem.store (m : Mem) (i v : U32) : Mem :=\n"
   "  Mem.mk (fun j => bif j == i then v else m.get j)\n\n";
 
-enum a_bend_kind { bk_bool, bk_u32, bk_int, bk_struct, bk_other };
+enum a_lean_kind { bk_bool, bk_u32, bk_int, bk_struct, bk_other };
 
-static a_bend_kind kind_of(a_type_ptr type)
+static a_lean_kind kind_of(a_type_ptr type)
 {
   if (type == NULL) return bk_other;
   if (is_bool_type(type)) return bk_bool;
@@ -287,20 +286,20 @@ static a_bend_kind kind_of(a_type_ptr type)
 static const char *struct_name(a_type_ptr type)
 {
   a_type_ptr t = skip_typerefs(type);
-  if (in_bend_ns(t->source_corresp.parent_scope)) {
+  if (in_lean_ns(t->source_corresp.parent_scope)) {
     if (t->source_corresp.name != NULL &&
         (strcmp(t->source_corresp.name, "Mem") == 0 ||
          strcmp(t->source_corresp.name, "Ram") == 0)) {
       uses_mem = 1;
       return "Mem";
     }  /* if */
-    not_supported(NULL, "a type in namespace bend other than bend::Mem and bend::Ram");
+    not_supported(NULL, "a type in namespace lean other than lean::Mem and lean::Ram");
     return "?";
   }  /* if */
   return safe_name(t->source_corresp.name);
 }
 
-static const char *bend_type(a_type_ptr type, const a_source_position *pos)
+static const char *lean_type(a_type_ptr type, const a_source_position *pos)
 {
   switch (kind_of(type)) {
     case bk_bool:   return "Bool";
@@ -373,8 +372,8 @@ static int constant_value(an_expr_node_ptr e, unsigned long long *value)
 /* A recursive function f(n, ...) must have an unsigned int first parameter */
 /* n, must not assign n, must test n against 0 before each recursive call,  */
 /* and each recursive call must be f(n - 1, ...).  See the header comment   */
-/* for the Lean form (f.go with a Nat bend_k that counts down).  Lean       */
-/* checks the structural recursion on bend_k.                               */
+/* for the Lean form (f.go with a Nat fuel that counts down).  Lean         */
+/* checks the structural recursion on fuel.                                 */
 /* ------------------------------------------------------------------------ */
 
 enum a_zero_state { zs_unknown, zs_zero, zs_nonzero };
@@ -619,9 +618,9 @@ static char *tr_call(an_expr_node_ptr e)
       return fmt("?");
     }  /* if */
     return app(rec.go_name, first_arg->next,
-               fmt("bend_p (%s - 1#32)", var_name(rec.n)));
+               fmt("fuel' (%s - 1#32)", var_name(rec.n)));
   }  /* if */
-  if (in_bend_ns(f->variant.routine.ptr->source_corresp.parent_scope)) {
+  if (in_lean_ns(f->variant.routine.ptr->source_corresp.parent_scope)) {
     const char *nm = f->variant.routine.ptr->source_corresp.name;
     const char *bn = NULL;
     if (nm != NULL && (strcmp(nm, "load") == 0 || strcmp(nm, "ram_load") == 0)) {
@@ -630,7 +629,7 @@ static char *tr_call(an_expr_node_ptr e)
       bn = "Mem.store";
     }  /* if */
     if (bn == NULL) {
-      not_supported(&e->position, "a function in namespace bend other than "
+      not_supported(&e->position, "a function in namespace lean other than "
                                   "load, ram_load and ram_store");
       return fmt("?");
     }  /* if */
@@ -652,7 +651,7 @@ static char *tr_operation(an_expr_node_ptr e)
   an_expr_operator_kind op = e->variant.operation.kind;
   an_expr_node_ptr a = e->variant.operation.operands;
   an_expr_node_ptr b = a != NULL ? a->next : NULL;
-  a_bend_kind rk = kind_of(e->type);
+  a_lean_kind rk = kind_of(e->type);
   a_boolean known;
 
   /* In a recursive function, a test of n against 0 has a known value. */
@@ -674,7 +673,7 @@ static char *tr_operation(an_expr_node_ptr e)
       break;
     case eok_cast:
     case eok_bool_cast: {
-      a_bend_kind ak = kind_of(a->type);
+      a_lean_kind ak = kind_of(a->type);
       if (rk == ak && rk != bk_int) return tr_expr(a);
       if (rk == bk_bool) {
         if (ak == bk_int) return tr_boolish(a);
@@ -740,7 +739,7 @@ static char *tr_operation(an_expr_node_ptr e)
         /* Only the branch that runs is translated. */
         return tr_expr(known ? b : c);
       }  /* if */
-      (void)bend_type(e->type, &e->position);
+      (void)lean_type(e->type, &e->position);
       return fmt("(bif %s then %s else %s)", tr_expr(a), tr_expr(b),
                  tr_expr(c));
     }
@@ -868,7 +867,7 @@ static void tr_seq(Str *out, int level, a_statement_ptr s, const Cont *k,
 static void emit_let(Str *out, const char *name, const char *value,
                      a_type_ptr type)
 {
-  s_add(out, "let %s : %s := %s\n", name, bend_type(type, NULL), value);
+  s_add(out, "let %s : %s := %s\n", name, lean_type(type, NULL), value);
 }
 
 /* Translate an assignment statement into a Lean let.  Return FALSE if the
@@ -998,7 +997,7 @@ static void tr_seq(Str *out, int level, a_statement_ptr s, const Cont *k,
           break;
         }  /* if */
         const char *name = var_name(di->variable);
-        (void)bend_type(di->variable->type, &s->position);
+        (void)lean_type(di->variable->type, &s->position);
         indent(out, level);
         emit_let(out, name, tr_dynamic_init(di, &s->position),
                  di->variable->type);
@@ -1057,7 +1056,7 @@ static void gen_struct(Str *out, a_type_ptr type)
         type->source_corresp.name, name);
   for (a_field_ptr f = fields; f != NULL; f = f->next) {
     s_add(out, "  %s : %s\n", safe_name(f->source_corresp.name),
-          bend_type(f->type, &f->source_corresp.decl_position));
+          lean_type(f->type, &f->source_corresp.decl_position));
   }  /* for */
   s_add(out, "\n");
 }
@@ -1069,7 +1068,7 @@ static void gen_routine(Str *out, a_routine_ptr rout)
 
   a_source_position *pos = &rout->source_corresp.decl_position;
   a_type_ptr rtype = skip_typerefs(rout->type)->variant.routine.return_type;
-  const char *result_type = bend_type(rtype, pos);
+  const char *result_type = lean_type(rtype, pos);
 
   a_scope_ptr scope = scope_for_routine(rout);
   a_variable_ptr params = scope->variant.routine.parameters;
@@ -1078,7 +1077,7 @@ static void gen_routine(Str *out, a_routine_ptr rout)
   Str plist = {NULL, 0, 0};   /* " (a : T) (b : U)" */
   Str alist = {NULL, 0, 0};   /* " a b" */
   for (a_variable_ptr p = params; p != NULL; p = p->next) {
-    s_add(&plist, " (%s : %s)", var_name(p), bend_type(p->type, pos));
+    s_add(&plist, " (%s : %s)", var_name(p), lean_type(p->type, pos));
     s_add(&alist, " %s", var_name(p));
     env_bind(&env, var_name(p), p->type);
   }  /* for */
@@ -1122,11 +1121,11 @@ static void gen_routine(Str *out, a_routine_ptr rout)
   tr_seq(&case1, 2, scope->assoc_block, NULL, env);
   rec.state = zs_unknown;
 
-  s_add(out, "/-- C++: %s (recursive: bend_k counts down with %s) -/\n",
+  s_add(out, "/-- C++: %s (recursive: fuel counts down with %s) -/\n",
         rout->source_corresp.name, var_name(params));
-  s_add(out, "def %s (bend_k : Nat)%s : %s :=\n", rec.go_name, s_get(&plist),
+  s_add(out, "def %s (fuel : Nat)%s : %s :=\n", rec.go_name, s_get(&plist),
         result_type);
-  s_add(out, "  match bend_k with\n  | 0 =>\n%s  | bend_p + 1 =>\n%s\n",
+  s_add(out, "  match fuel with\n  | 0 =>\n%s  | fuel' + 1 =>\n%s\n",
         s_get(&case0), s_get(&case1));
   s_add(out, "/-- C++: %s -/\n", rout->source_corresp.name);
   s_add(out, "def %s%s : %s :=\n  %s %s.toNat%s\n\n", name, s_get(&plist),
@@ -1180,7 +1179,7 @@ static void gen_law(Str *laws, a_routine_ptr rout)
   if (params != NULL) {
     s_add(laws, "forall");
     for (a_variable_ptr p = params; p != NULL; p = p->next) {
-      const char *t = bend_type(p->type, pos);
+      const char *t = lean_type(p->type, pos);
       s_add(laws, " (%s : %s%s)", var_name(p),
             strcmp(t, "Bool") == 0 ? "" : "C.", t);
       s_add(&args, " %s", var_name(p));
