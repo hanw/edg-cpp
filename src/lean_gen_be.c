@@ -233,13 +233,104 @@ static const char *const lean_reserved[] = {
   "Nat", "Bool", "BitVec", "C", "Laws", "fuel", NULL
 };
 
-static const char *safe_name(const char *name)
+static a_boolean is_reserved(const char *name)
 {
-  if (name == NULL) return "unnamed";
   for (int i = 0; lean_reserved[i] != NULL; i++) {
-    if (strcmp(name, lean_reserved[i]) == 0) return fmt("%s_", name);
+    if (strcmp(name, lean_reserved[i]) == 0) return TRUE;
   }  /* for */
-  return name;
+  return FALSE;
+}
+
+/* Lean names.  Each C++ entity gets its own Lean name, and no two entities
+   that can meet in one Lean scope get the same name:
+     - the global names (functions, structs) in namespace C;
+     - the fields of one struct;
+     - the parameters and locals of one function (they must also differ from
+       the global names: a C++ block can end and a global function be
+       called after it, where the Lean let would still be in scope);
+     - the laws in namespace Laws.
+   The name is the C++ name; a Lean keyword gets "_"; a name that is taken
+   gets "_1", "_2", ... (so "in" and "in_" are "in_" and "in__1", and a block
+   variable x after a parameter x is "x_1").  An assignment to a variable
+   writes a new let with the same Lean name, so an update inside a block
+   stays visible after it. */
+struct NameTab {
+  const void  **key;
+  const char  **name;
+  int           n, cap;
+};
+
+static void tab_add(NameTab *t, const void *key, const char *name)
+{
+  if (t->n == t->cap) {
+    int c = t->cap != 0 ? t->cap * 2 : 64;
+    const void **k = (const void **)realloc((void *)t->key, (size_t)c * sizeof(void *));
+    const char **v = (const char **)realloc((void *)t->name, (size_t)c * sizeof(char *));
+    if (k == NULL || v == NULL) out_of_memory();
+    t->key = k; t->name = v; t->cap = c;
+  }  /* if */
+  t->key[t->n] = key;
+  t->name[t->n] = name;
+  t->n++;
+}
+
+static const char *tab_find(const NameTab *t, const void *key)
+{
+  for (int i = 0; i < t->n; i++) {
+    if (t->key[i] == key) return t->name[i];
+  }  /* for */
+  return NULL;
+}
+
+static a_boolean tab_has_name(const NameTab *t, const char *name)
+{
+  for (int i = 0; i < t->n; i++) {
+    if (strcmp(t->name[i], name) == 0) return TRUE;
+  }  /* for */
+  return FALSE;
+}
+
+static NameTab global_names = {NULL, NULL, 0, 0};   /* functions, structs */
+static NameTab field_names  = {NULL, NULL, 0, 0};   /* key: the field */
+static NameTab local_names  = {NULL, NULL, 0, 0};   /* of the current function */
+static NameTab law_names    = {NULL, NULL, 0, 0};   /* in namespace Laws */
+
+/* A new name for key in table t (and, for locals, unlike every global). */
+static const char *alloc_name(NameTab *t, const void *key, const char *cname,
+                              const NameTab *also)
+{
+  const char *found = tab_find(t, key);
+  if (found != NULL) return found;
+  const char *base = cname != NULL ? cname : "unnamed";
+  const char *cand = is_reserved(base) ? fmt("%s_", base) : base;
+  for (int k = 1; is_reserved(cand) || tab_has_name(t, cand) ||
+                  (also != NULL && tab_has_name(also, cand)); k++) {
+    cand = fmt("%s_%d", base, k);
+  }  /* for */
+  tab_add(t, key, cand);
+  return cand;
+}
+
+/* A field gets its name when its struct is generated (gen_struct): unique
+   among the fields of that struct. */
+static const char *field_name(a_field_ptr f)
+{
+  const char *found = tab_find(&field_names, f);
+  if (found != NULL) return found;
+  not_supported(&f->source_corresp.decl_position, "a field of a struct that is not translated");
+  return "?";
+}
+
+static const char *global_name(const void *entity, const char *cname)
+{
+  return alloc_name(&global_names, entity, cname, NULL);
+}
+
+static void free_names(NameTab *t)
+{
+  free((void *)t->key);
+  free((void *)t->name);
+  t->key = NULL; t->name = NULL; t->n = t->cap = 0;
 }
 
 /* Entities in namespace "lean" (include/lean_mem.h) are primitives with a
@@ -296,7 +387,7 @@ static const char *struct_name(a_type_ptr type)
     not_supported(NULL, "a type in namespace lean other than lean::Mem and lean::Ram");
     return "?";
   }  /* if */
-  return safe_name(t->source_corresp.name);
+  return global_name(t, t->source_corresp.name);
 }
 
 static const char *lean_type(a_type_ptr type, const a_source_position *pos)
@@ -317,7 +408,7 @@ static const char *lean_type(a_type_ptr type, const a_source_position *pos)
 
 static const char *var_name(a_variable_ptr var)
 {
-  return safe_name(var->source_corresp.name);
+  return alloc_name(&local_names, var, var->source_corresp.name, &global_names);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -642,8 +733,8 @@ static char *tr_call(an_expr_node_ptr e)
                                     "is not supported)",
                                     f->variant.routine.ptr->source_corresp.name));
   }  /* if */
-  return app(safe_name(f->variant.routine.ptr->source_corresp.name), f->next,
-             NULL);
+  return app(global_name(f->variant.routine.ptr, f->variant.routine.ptr->source_corresp.name),
+             f->next, NULL);
 }
 
 static char *tr_operation(an_expr_node_ptr e)
@@ -729,7 +820,7 @@ static char *tr_operation(an_expr_node_ptr e)
     case eok_dot_field: {
       a_field_ptr field = b->variant.field.ptr;
       (void)struct_name(a->type);
-      return fmt("%s.%s", tr_expr(a), safe_name(field->source_corresp.name));
+      return fmt("%s.%s", tr_expr(a), field_name(field));
     }
     case eok_call:
       return tr_call(e);
@@ -939,7 +1030,7 @@ static a_boolean tr_assignment(Str *out, int level, an_expr_node_ptr e,
   if (field != NULL) {
     /* A new struct with one new field value. */
     value = fmt("{ %s with %s := %s }", name,
-                safe_name(field->source_corresp.name), value);
+                field_name(field), value);
   }  /* if */
   indent(out, level);
   emit_let(out, name, value, var->type);
@@ -1054,8 +1145,13 @@ static void gen_struct(Str *out, a_type_ptr type)
   cur_function = name;
   s_add(out, "/-- C++: struct %s -/\nstructure %s where\n",
         type->source_corresp.name, name);
+  NameTab mine = {NULL, NULL, 0, 0};
   for (a_field_ptr f = fields; f != NULL; f = f->next) {
-    s_add(out, "  %s : %s\n", safe_name(f->source_corresp.name),
+    tab_add(&field_names, f, alloc_name(&mine, f, f->source_corresp.name, NULL));
+  }  /* for */
+  free_names(&mine);
+  for (a_field_ptr f = fields; f != NULL; f = f->next) {
+    s_add(out, "  %s : %s\n", field_name(f),
           lean_type(f->type, &f->source_corresp.decl_position));
   }  /* for */
   s_add(out, "\n");
@@ -1063,7 +1159,8 @@ static void gen_struct(Str *out, a_type_ptr type)
 
 static void gen_routine(Str *out, a_routine_ptr rout)
 {
-  const char *name = safe_name(rout->source_corresp.name);
+  const char *name = global_name(rout, rout->source_corresp.name);
+  free_names(&local_names);
   cur_function = name;
 
   a_source_position *pos = &rout->source_corresp.decl_position;
@@ -1161,7 +1258,8 @@ static a_boolean is_law(a_routine_ptr rout)
 
 static void gen_law(Str *laws, a_routine_ptr rout)
 {
-  const char *name = safe_name(rout->source_corresp.name);
+  /* Right after gen_routine of rout: local_names has its parameters. */
+  const char *name = global_name(rout, rout->source_corresp.name);
   a_source_position *pos = &rout->source_corresp.decl_position;
   cur_function = name;
   a_type_ptr rtype = skip_typerefs(rout->type)->variant.routine.return_type;
@@ -1173,7 +1271,7 @@ static void gen_law(Str *laws, a_routine_ptr rout)
   a_scope_ptr scope = scope_for_routine(rout);
   s_add(laws, "/-- C++: %s -/\ndef %s : Prop :=\n  ",
         rout->source_corresp.name,
-        safe_name(rout->source_corresp.name + sizeof(LAW_PREFIX) - 1));
+        alloc_name(&law_names, rout, rout->source_corresp.name + sizeof(LAW_PREFIX) - 1, NULL));
   Str args = {NULL, 0, 0};
   a_variable_ptr params = scope->variant.routine.parameters;
   if (params != NULL) {
@@ -1187,6 +1285,60 @@ static void gen_law(Str *laws, a_routine_ptr rout)
     s_add(laws, ",\n    ");
   }  /* if */
   s_add(laws, "C.%s%s = true\n\n", name, s_get(&args));
+}
+
+/* Only the functions and structs at file scope are translated.  A function
+   defined in a namespace (other than std, namespace lean and the system
+   headers) would be left out without a word, and with it a law; so it is
+   an error. */
+static void reject_nested(a_scope_ptr scope, const char *prefix);
+
+/* The member functions of the classes of a scope (a law as a static member
+   would also be left out). */
+static void reject_members(a_scope_ptr scope, const char *prefix)
+{
+  for (a_type_ptr t = scope->types; t != NULL; t = t->next) {
+    if (t->kind != tk_struct && t->kind != tk_class && t->kind != tk_union) continue;
+    if (seq_is_in_system_header(t->source_corresp.decl_position.seq)) continue;
+    if (t->variant.class_struct_union.extra_info == NULL) continue;
+    a_scope_ptr cs = t->variant.class_struct_union.extra_info->assoc_scope;
+    if (cs == NULL) continue;
+    const char *full = fmt("%s%s::", prefix, t->source_corresp.name != NULL ? t->source_corresp.name : "(anonymous)");
+    for (a_routine_ptr r = cs->routines; r != NULL; r = r->next) {
+      if (r->function_def_number == NULL_function_def_number) continue;
+      if (r->compiler_generated || r->source_corresp.name == NULL) continue;
+      cur_function = fmt("%s%s", full, r->source_corresp.name);
+      not_supported(&r->source_corresp.decl_position,
+                    fmt("a member function of %.*s (only functions at file "
+                        "scope are translated; a law here would be left out)",
+                        (int)strlen(full) - 2, full));
+    }  /* for */
+    reject_members(cs, full);
+  }  /* for */
+}
+
+static void reject_nested(a_scope_ptr scope, const char *prefix)
+{
+  reject_members(scope, prefix);
+  for (a_namespace_ptr n = scope->namespaces; n != NULL; n = n->next) {
+    if (n->is_namespace_alias || n->is_std) continue;
+    const char *nm = n->source_corresp.name != NULL ? n->source_corresp.name : "(anonymous)";
+    if (strcmp(nm, "lean") == 0 && prefix[0] == '\0') continue;
+    if (seq_is_in_system_header(n->source_corresp.decl_position.seq)) continue;
+    a_scope_ptr ns = n->variant.assoc_scope;
+    const char *full = fmt("%s%s::", prefix, nm);
+    for (a_routine_ptr r = ns->routines; r != NULL; r = r->next) {
+      if (r->function_def_number == NULL_function_def_number) continue;
+      if (r->compiler_generated || r->source_corresp.name == NULL) continue;
+      if (seq_is_in_system_header(r->source_corresp.decl_position.seq)) continue;
+      cur_function = fmt("%s%s", full, r->source_corresp.name);
+      not_supported(&r->source_corresp.decl_position,
+                    fmt("a function in namespace %.*s (only functions at file "
+                        "scope are translated; a law here would be left out)",
+                        (int)strlen(full) - 2, full));
+    }  /* for */
+    reject_nested(ns, full);
+  }  /* for */
 }
 
 /* The last part of a path: "dir/x.lean" -> "x.lean". */
@@ -1391,6 +1543,43 @@ static void dump_scope(Str *s, a_scope_ptr scope, const char *prefix,
   }  /* for */
 }
 
+/* EDG_LAYOUT_OUT: for each class at namespace scope (not in std) that has
+   fields, its size and the name and byte offset of each field, as JSON.  A
+   program built with the same front end has the same layout; so a run of
+   the program can map an address in an object to the name of a member. */
+static void dump_layout_scope(Str *s, a_scope_ptr scope, const char *prefix, int *first)
+{
+  for (a_type_ptr t = scope->types; t != NULL; t = t->next) {
+    if ((t->kind != tk_struct && t->kind != tk_class) || t->source_corresp.name == NULL) continue;
+    a_field_ptr f = t->variant.class_struct_union.field_list;
+    if (f == NULL) continue;
+    s_add(s, "%s\n  \"%s%s\": {\"size\": %llu, \"fields\": [", *first ? "" : ",", prefix,
+          t->source_corresp.name, (unsigned long long)t->size);
+    int k = 0;
+    for (; f != NULL; f = f->next) {
+      if (f->source_corresp.name == NULL) continue;
+      s_add(s, "%s[\"%s\", %llu]", k++ ? ", " : "", f->source_corresp.name,
+            (unsigned long long)f->offset);
+    }  /* for */
+    s_add(s, "]}");
+    *first = 0;
+  }  /* for */
+  for (a_namespace_ptr n = scope->namespaces; n != NULL; n = n->next) {
+    if (n->is_namespace_alias || n->is_std || n->source_corresp.name == NULL) continue;
+    dump_layout_scope(s, n->variant.assoc_scope, fmt("%s%s::", prefix, n->source_corresp.name), first);
+  }  /* for */
+}
+
+static void dump_layout(const char *name)
+{
+  Str s = {NULL, 0, 0};
+  int first = 1;
+  s_add(&s, "{");
+  dump_layout_scope(&s, il_header.primary_scope, "", &first);
+  s_add(&s, "\n}\n");
+  write_file(name, &s);
+}
+
 static void dump_data(const char *name)
 {
   Str s = {NULL, 0, 0};
@@ -1418,6 +1607,14 @@ translation unit has been processed.  The IL is not lowered.
   const char *src = il_header.primary_source_file != NULL ?
                       il_header.primary_source_file->file_name : "?";
   const char *data_name = getenv("EDG_DATA_OUT");
+  const char *layout_name = getenv("EDG_LAYOUT_OUT");
+
+  if (layout_name != NULL && layout_name[0] != '\0') {
+    /* Layout only (see dump_layout). */
+    dump_layout(layout_name);
+    free_all_bufs();
+    return;
+  }  /* if */
 
   if (data_name != NULL && data_name[0] != '\0') {
     /* Data only (see dump_data); no Lean output unless EDG_LEAN_OUT is set. */
@@ -1437,6 +1634,8 @@ translation unit has been processed.  The IL is not lowered.
   for (a_type_ptr t = file_scope->types; t != NULL; t = t->next) {
     if (is_user_struct(t)) gen_struct(&out, t);
   }  /* for */
+
+  reject_nested(file_scope, "");
 
   for (a_routine_ptr r = file_scope->routines; r != NULL; r = r->next) {
     if (r->function_def_number == NULL_function_def_number) continue;
@@ -1493,6 +1692,10 @@ translation unit has been processed.  The IL is not lowered.
   }  /* if */
   free_all_bufs();
   free_done_routines();
+  free_names(&global_names);
+  free_names(&field_names);
+  free_names(&local_names);
+  free_names(&law_names);
   cur_function = "";
   if (n_errors != 0) {
     fprintf(stderr, "lean back end: %d construct(s) not supported; the Lean "
