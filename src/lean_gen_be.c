@@ -60,6 +60,17 @@ C.law_<name> ... = true" in namespace Laws in that file, which imports the
 code file (EDG_LEAN_OUT, in the same directory, as a Lean module).  The
 proofs prove these propositions.
 
+Modules: EDG_LEAN_IMPORT = "Mod=file.cpp;Mod2=file2.cpp" (absolute paths)
+names files that this translation unit includes and that were translated
+alone before, to the Lean modules Mod, Mod2 (with their laws in their own
+laws files).  The entities of such a file (and of the files it includes) are
+not written again: the code file imports Mod, and has no U32 and no Mem
+prelude (the first module has them).  Their Lean names are allocated first,
+in the order of a translation of that file alone, so the names are the same
+as in Mod; the laws of Mod are not repeated in the laws file.  A name of this
+unit never takes a name of Mod.  A file in EDG_LEAN_IMPORT that is not
+included is an error.
+
 The output goes to the file named by the EDG_LEAN_OUT environment variable
 (standard output if it is not set).  If any construct is not supported, the
 messages go to standard error and the program exits with status 1.
@@ -1594,6 +1605,117 @@ static void dump_data(const char *name)
 
 using namespace lean_gen;
 
+/* ------------------------------------------------------------------------ */
+/* Imported modules (EDG_LEAN_IMPORT).                                      */
+/* ------------------------------------------------------------------------ */
+
+struct Import {
+  const char   *module;
+  char         *real;      /* realpath of the file */
+  a_seq_number  lo, hi;    /* its sequence numbers (with its includes) */
+  a_boolean     found;
+};
+enum { MAX_IMPORTS = 16 };
+static Import imports[MAX_IMPORTS];
+static int    n_imports = 0;
+
+static void find_imports(a_source_file_ptr f)
+{
+  for (; f != NULL; f = f->next) {
+    if (f->full_name != NULL) {
+      char *r = realpath(f->full_name, NULL);
+      if (r != NULL) {
+        for (int i = 0; i < n_imports; i++) {
+          if (!imports[i].found && strcmp(r, imports[i].real) == 0) {
+            imports[i].lo = f->first_seq_number;
+            imports[i].hi = f->last_seq_number;
+            imports[i].found = TRUE;
+          }  /* if */
+        }  /* for */
+        free(r);
+      }  /* if */
+    }  /* if */
+    find_imports(f->first_child_file);
+  }  /* for */
+}
+
+/* Read EDG_LEAN_IMPORT; FALSE on an error (reported). */
+static a_boolean read_imports(void)
+{
+  const char *v = getenv("EDG_LEAN_IMPORT");
+  if (v == NULL || v[0] == '\0') return TRUE;
+  char *spec = fmt("%s", v);
+  for (char *item = strtok(spec, ";"); item != NULL; item = strtok(NULL, ";")) {
+    char *eq = strchr(item, '=');
+    if (eq == NULL || eq == item || n_imports == MAX_IMPORTS) {
+      fprintf(stderr, "lean back end: EDG_LEAN_IMPORT: expected Module=file "
+                      "(at most %d): %s\n", MAX_IMPORTS, item);
+      return FALSE;
+    }  /* if */
+    *eq = '\0';
+    char *r = realpath(eq + 1, NULL);
+    if (r == NULL) {
+      fprintf(stderr, "lean back end: EDG_LEAN_IMPORT: no file %s\n", eq + 1);
+      return FALSE;
+    }  /* if */
+    imports[n_imports].module = fmt("%s", item);
+    imports[n_imports].real = fmt("%s", r);
+    imports[n_imports].found = FALSE;
+    free(r);
+    n_imports++;
+  }  /* for */
+  find_imports(il_header.primary_source_file);
+  for (int i = 0; i < n_imports; i++) {
+    if (!imports[i].found) {
+      fprintf(stderr, "lean back end: EDG_LEAN_IMPORT: %s (module %s) is not "
+                      "included\n", imports[i].real, imports[i].module);
+      return FALSE;
+    }  /* if */
+  }  /* for */
+  return TRUE;
+}
+
+static a_boolean is_imported(const a_source_position *pos)
+{
+  for (int i = 0; i < n_imports; i++) {
+    if (imports[i].lo <= pos->seq && pos->seq <= imports[i].hi) return TRUE;
+  }  /* for */
+  return FALSE;
+}
+
+/* Translate the structs and functions at file scope: the imported ones
+   (pass 0: into a scratch string, for their names) or the others (pass 1). */
+static void gen_file_scope(a_scope_ptr file_scope, int pass, Str *out,
+                           Str *laws, int *n_laws)
+{
+  Str scratch = {NULL, 0, 0};
+  Str scratch_laws = {NULL, 0, 0};
+  for (a_type_ptr t = file_scope->types; t != NULL; t = t->next) {
+    if (!is_user_struct(t)) continue;
+    if (is_imported(&t->source_corresp.decl_position) != (pass == 0)) continue;
+    gen_struct(pass == 0 ? &scratch : out, t);
+  }  /* for */
+  for (a_routine_ptr r = file_scope->routines; r != NULL; r = r->next) {
+    if (r->function_def_number == NULL_function_def_number) continue;
+    if (r->compiler_generated || r->source_corresp.name == NULL) continue;
+    if (is_imported(&r->source_corresp.decl_position) != (pass == 0)) continue;
+    for (a_routine_ptr q = file_scope->routines; q != r; q = q->next) {
+      if (q->function_def_number != NULL_function_def_number &&
+          q->source_corresp.name != NULL &&
+          strcmp(q->source_corresp.name, r->source_corresp.name) == 0) {
+        cur_function = r->source_corresp.name;
+        not_supported(&r->source_corresp.decl_position, "overloading");
+      }  /* if */
+    }  /* for */
+    gen_routine(pass == 0 ? &scratch : out, r);
+    mark_done(r);
+    if (is_law(r)) {
+      gen_law(pass == 0 ? &scratch_laws : laws, r);
+      if (pass != 0) (*n_laws)++;
+    }  /* if */
+  }  /* for */
+}
+
 void back_end(void)
 /*
 Entry point called by the front end (BACK_END_SHOULD_BE_CALLED) after the
@@ -1631,38 +1753,32 @@ translation unit has been processed.  The IL is not lowered.
     }  /* if */
   }  /* if */
 
-  for (a_type_ptr t = file_scope->types; t != NULL; t = t->next) {
-    if (is_user_struct(t)) gen_struct(&out, t);
-  }  /* for */
+  if (!read_imports()) {
+    free_all_bufs();
+    exit(1);
+  }  /* if */
 
   reject_nested(file_scope, "");
 
-  for (a_routine_ptr r = file_scope->routines; r != NULL; r = r->next) {
-    if (r->function_def_number == NULL_function_def_number) continue;
-    if (r->compiler_generated || r->source_corresp.name == NULL) continue;
-    for (a_routine_ptr q = file_scope->routines; q != r; q = q->next) {
-      if (q->function_def_number != NULL_function_def_number &&
-          q->source_corresp.name != NULL &&
-          strcmp(q->source_corresp.name, r->source_corresp.name) == 0) {
-        cur_function = r->source_corresp.name;
-        not_supported(&r->source_corresp.decl_position, "overloading");
-      }  /* if */
-    }  /* for */
-    gen_routine(&out, r);
-    mark_done(r);
-    if (is_law(r)) {
-      gen_law(&laws, r);
-      n_laws++;
-    }  /* if */
-  }  /* for */
+  /* The names of the imported entities first, as in their own module. */
+  gen_file_scope(file_scope, 0, &out, &laws, &n_laws);
+  gen_file_scope(file_scope, 1, &out, &laws, &n_laws);
 
   {
     Str all = {NULL, 0, 0};
+    for (int i = 0; i < n_imports; i++) {
+      s_add(&all, "import %s\n", imports[i].module);
+    }  /* for */
+    if (n_imports != 0) s_add(&all, "\n");
     s_add(&all, "-- Generated by EDG cpfe-lean from %s.\n", src);
     s_add(&all, "-- Do not edit: run the translation again.\n\n");
-    s_add(&all, "namespace C\n\n/-- C++ unsigned int -/\n"
-                "abbrev U32 := BitVec 32\n\n");
-    s_add(&all, "%s%send C\n", uses_mem ? MEM_PRELUDE : "", s_get(&out));
+    if (n_imports == 0) {
+      s_add(&all, "namespace C\n\n/-- C++ unsigned int -/\n"
+                  "abbrev U32 := BitVec 32\n\n");
+      s_add(&all, "%s%send C\n", uses_mem ? MEM_PRELUDE : "", s_get(&out));
+    } else {
+      s_add(&all, "namespace C\n\n%send C\n", s_get(&out));
+    }  /* if */
     out = all;
   }
   const char *out_name = getenv("EDG_LEAN_OUT");
