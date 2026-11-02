@@ -32243,6 +32243,12 @@ the value representation of the integer value.
             /* This variable is not allocated in the interpreter.  See if it
                is a constant-valued variable. */
             a_constant_ptr  con = var_constant_value(var);
+            if (con == NULL && eval_all_routines() &&
+                var->init_kind == initk_static && var->initializer.constant != NULL) {
+              /* EDG_EVAL_ALL: the value of a statically initialized variable
+                 that is not const (a table that a header defines). */
+              con = var->initializer.constant;
+            }  /* if */
             if (con != NULL) {
               a_boolean  saved_flag = ips->disallow_mutable_field_load;
               ips->disallow_mutable_field_load = TRUE;

@@ -1431,19 +1431,39 @@ static int n_data_errors = 0;
 
 static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type);
 
+static void dump_zero(Str *s, a_type_ptr type);
+static a_boolean is_stub_vector(a_type_ptr t);
+
+/* The zero value of the fields of class type t (base class fields first, flattened), as pairs. */
+static void dump_zero_fields(Str *s, a_type_ptr t, int *first)
+{
+  a_class_type_supplement_ptr ex = t->variant.class_struct_union.extra_info;
+  if (ex != NULL) {
+    for (a_base_class_ptr b = ex->direct_base_classes; b != NULL; b = b->next_direct) {
+      if (b->is_virtual) continue;
+      dump_zero_fields(s, skip_typerefs(b->type), first);
+    }  /* for */
+  }  /* if */
+  for (a_field_ptr f = t->variant.class_struct_union.field_list; f != NULL;
+       f = f->next) {
+    s_add(s, "%s\"%s\": ", *first ? "" : ", ",
+          f->source_corresp.name != NULL ? f->source_corresp.name : "?");
+    dump_zero(s, f->type);
+    *first = 0;
+  }  /* for */
+}
+
 static void dump_zero(Str *s, a_type_ptr type)
 {
   a_type_ptr t = skip_typerefs(type);
   if (t->kind == tk_struct || t->kind == tk_class) {
+    if (is_stub_vector(t)) {
+      s_add(s, "[]");
+      return;
+    }  /* if */
     s_add(s, "{");
     int first = 1;
-    for (a_field_ptr f = t->variant.class_struct_union.field_list; f != NULL;
-         f = f->next) {
-      s_add(s, "%s\"%s\": ", first ? "" : ", ",
-            f->source_corresp.name != NULL ? f->source_corresp.name : "?");
-      dump_zero(s, f->type);
-      first = 0;
-    }  /* for */
+    dump_zero_fields(s, t, &first);
     s_add(s, "}");
   } else if (t->kind == tk_array) {
     s_add(s, "[");
@@ -1507,6 +1527,48 @@ static a_boolean is_stub_vector(a_type_ptr t)
          strcmp(f->source_corresp.name, "n") == 0 && f->next == NULL;
 }
 
+/* The fields of the class constant whose entries start at c, as "name": value pairs, without braces. The
+   base class subobjects come first (each one a leading aggregate of the list); their fields are written
+   flattened into the same object, in base order. *first is 0 once a pair has been written. */
+static void dump_fields_flat(Str *s, a_constant_ptr c, a_type_ptr t, int *first)
+{
+  a_class_type_supplement_ptr ex = t->variant.class_struct_union.extra_info;
+  if (ex != NULL) {
+    for (a_base_class_ptr b = ex->direct_base_classes; b != NULL; b = b->next_direct) {
+      if (b->is_virtual) continue;
+      if (c != NULL && c->kind == ck_aggregate) {
+        dump_fields_flat(s, c->variant.aggregate.first_constant, skip_typerefs(b->type), first);
+        c = c->next;
+      }  /* if */
+    }  /* for */
+  }  /* if */
+  int nf = count_fields(t), k = 0;
+  a_constant_ptr *val = (a_constant_ptr *)calloc((size_t)(nf + 1), sizeof(a_constant_ptr));
+  a_field_ptr f = t->variant.class_struct_union.field_list;
+  if (val == NULL) out_of_memory();
+  for (; c != NULL; c = c->next) {
+    if (c->kind == ck_designator) {
+      k = 0;
+      for (f = t->variant.class_struct_union.field_list;
+           f != NULL && f != c->variant.designator.variant.field;
+           f = f->next) k++;
+      continue;
+    }  /* if */
+    if (k < nf) val[k] = c;
+    k++;
+    if (f != NULL) f = f->next;
+  }  /* for */
+  k = 0;
+  for (f = t->variant.class_struct_union.field_list; f != NULL; f = f->next, k++) {
+    s_add(s, "%s\"%s\": ", *first ? "" : ", ",
+          f->source_corresp.name != NULL ? f->source_corresp.name : "?");
+    *first = 0;
+    if (val[k] != NULL) dump_constant(s, val[k], f->type);
+    else dump_zero(s, f->type);
+  }  /* for */
+  free(val);
+}
+
 static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
 {
   a_type_ptr t = skip_typerefs(type);
@@ -1556,48 +1618,24 @@ static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
          current field or element, and ck_init_repeat entries. */
       a_constant_ptr c = cp->variant.aggregate.first_constant;
       if (t->kind == tk_struct || t->kind == tk_class) {
-        int nf = count_fields(t), k = 0;
-        a_constant_ptr *val = (a_constant_ptr *)calloc((size_t)(nf + 1),
-                                                       sizeof(a_constant_ptr));
-        a_field_ptr f = t->variant.class_struct_union.field_list;
-        if (val == NULL) out_of_memory();
-        for (; c != NULL; c = c->next) {
-          if (c->kind == ck_designator) {
-            k = 0;
-            for (f = t->variant.class_struct_union.field_list;
-                 f != NULL && f != c->variant.designator.variant.field;
-                 f = f->next) k++;
-            continue;
-          }  /* if */
-          if (k < nf) val[k] = c;
-          k++;
-          if (f != NULL) f = f->next;
-        }  /* for */
         if (is_stub_vector(t)) {
           unsigned long cnt = 0;
-          if (val[1] != NULL && val[1]->kind == ck_integer) {
+          a_constant_ptr v0 = c, v1 = (c != NULL) ? c->next : NULL;
+          if (v1 != NULL && v1->kind == ck_integer) {
             a_boolean ovflo = FALSE;
-            cnt = (unsigned long)unsigned_value_of_integer_constant(val[1], &ovflo);
+            cnt = (unsigned long)unsigned_value_of_integer_constant(v1, &ovflo);
           }  /* if */
-          if (val[0] != NULL && val[0]->kind == ck_aggregate)
-            dump_array(s, val[0]->variant.aggregate.first_constant,
+          if (v0 != NULL && v0->kind == ck_aggregate)
+            dump_array(s, v0->variant.aggregate.first_constant,
                        skip_typerefs(t->variant.class_struct_union.field_list->type), cnt);
           else
             s_add(s, "[]");
-          free(val);
           return;
         }  /* if */
+        int first = 1;
         s_add(s, "{");
-        k = 0;
-        for (f = t->variant.class_struct_union.field_list; f != NULL;
-             f = f->next, k++) {
-          s_add(s, "%s\"%s\": ", k == 0 ? "" : ", ",
-                f->source_corresp.name != NULL ? f->source_corresp.name : "?");
-          if (val[k] != NULL) dump_constant(s, val[k], f->type);
-          else dump_zero(s, f->type);
-        }  /* for */
+        dump_fields_flat(s, c, t, &first);
         s_add(s, "}");
-        free(val);
         return;
       }  /* if */
       if (t->kind == tk_array) {
