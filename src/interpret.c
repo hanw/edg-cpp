@@ -32132,6 +32132,16 @@ the value representation of the integer value.
                                            ips, expr, opnd1_type, opnd1_value,
                                            result_storage);
             break;
+          case eok_va_start:
+          case eok_va_end:
+            if (!eval_all_routines()) {
+              do_constexpr_fail(result);
+              info_with_pos(ec_constexpr_expression_cannot_be_interpreted,
+                            &expr->position, ips);
+            }  /* if */
+            /* EDG_EVAL_ALL: the variadic arguments of a logging function are
+               never read; va_start and va_end do nothing. */
+            break;
           case eok_call:
             /* Calls are handled separately.  We should not get here. */
 #if CHECKING
