@@ -26,6 +26,7 @@ templates.c -- Support for C++ templates.
 #include "disambig.h"
 #include "exprutil.h"
 #include "folding.h"
+#include "interpret.h"
 #include "trans_corresp.h"
 #if TEMPLATE_LOOKUP_NEEDED || DO_IL_LOWERING
 #include "lower_name.h"
@@ -37798,6 +37799,11 @@ inline in the class definition.
 */
 {
   a_boolean	result = FALSE;
+  if (eval_all_routines() && is_function_symbol(tip->instance_sym)) {
+    /* EDG_EVAL_ALL: instantiate every function template at its first use, as
+       an inline one, so the constant evaluator finds its body. */
+    return TRUE;
+  }  /* if */
   if (is_function_symbol(tip->instance_sym)) {
     /* If the is_inline flag is set in the routine entry then the routine
        must be inline whether or not an instantiation has been done or

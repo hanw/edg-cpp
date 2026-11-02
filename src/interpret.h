@@ -431,6 +431,9 @@ void interpret_init(void);
 void interpret_one_time_init(void);
 
 /* Conditionally close the "edg" namespace. */
+a_boolean eval_all_routines(void);
+/* TRUE if EDG_EVAL_ALL is set: the constant evaluator interprets any routine. */
+
 END_EDG_NAMESPACE
 
 #endif /* ifndef INTERPRET_H */

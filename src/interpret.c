@@ -47,6 +47,17 @@ interpret.c -- IL interpreter for constexpr functions
 /* Conditionally open the "edg" namespace. */
 BEGIN_EDG_NAMESPACE
 
+/* EDG_EVAL_ALL (set in the environment): the constant evaluator interprets
+   a call of any defined routine, constexpr or not.  Used by cpp-lean to run
+   the C++ that a compiler writes (a graph constructor) at translation time.
+   Off by default: the language rules are unchanged. */
+a_boolean eval_all_routines(void)
+{
+  static int state = -1;
+  if (state < 0) state = getenv("EDG_EVAL_ALL") != NULL;
+  return state ? TRUE : FALSE;
+}  /* eval_all_routines */
+
 /*
 This file implements an interpreter for a subset of the unlowered IL produced
 by the C++ front end.  Specifically, the subset corresponds to the constructs
@@ -23131,7 +23142,7 @@ callee; the iwp_1st_resume visit completes the call in the latter case.
       do_constexpr_fail(result);
       goto done;
     }  /* if */
-    if (!callee->is_constexpr) {
+    if (!callee->is_constexpr && !eval_all_routines()) {
       info_with_pos_sym(ec_constexpr_call_to_nonconstexpr_function,
                         expr_pos(callee_node, ips), symbol_for(callee), ips);
       do_constexpr_fail(result);
@@ -23193,7 +23204,7 @@ callee; the iwp_1st_resume visit completes the call in the latter case.
        is not fully parsed (e.g., requested due to a recursive call in a
        constexpr function). */
     callee_scope = scope_for_routine(callee);
-    if (!callee_scope->is_constexpr_routine) {
+    if (!callee_scope->is_constexpr_routine && !eval_all_routines()) {
       info_with_pos_sym(ec_constexpr_call_not_interpretable,
                         &call_node->position, symbol_for(callee), ips);
       do_constexpr_fail(result);
@@ -23427,7 +23438,7 @@ after the constructor body has been interpreted.
     info_with_pos(ec_constexpr_expression_cannot_be_interpreted, pos, ips);
     do_constexpr_fail(result);
     goto done;
-  } else if (!callee->is_constexpr) {
+  } else if (!callee->is_constexpr && !eval_all_routines()) {
     info_with_pos_sym(ec_constexpr_call_to_nonconstexpr_function,
                       pos, symbol_for(callee), ips);
     do_constexpr_fail(result);
@@ -23487,7 +23498,7 @@ after the constructor body has been interpreted.
        definition, so this also prevents the interpretation of a function that
        is not fully parsed (e.g., requested due to a recursive call in a
        constexpr function). */
-    if (!callee_scope->is_constexpr_routine) {
+    if (!callee_scope->is_constexpr_routine && !eval_all_routines()) {
       do_constexpr_fail(result);
       info_with_pos_sym(ec_constexpr_call_not_interpretable, pos,
                         symbol_for(callee), ips);
@@ -23991,7 +24002,7 @@ the iwp_1st_resume visit destroys the subobjects and undoes that mapping.
   /* Retrieve the routine scope, or issue an error. */
   if (callee == NULL) {
     unexpected_condition();
-  } else if (!callee->is_constexpr) {
+  } else if (!callee->is_constexpr && !eval_all_routines()) {
     info_with_pos_sym(ec_constexpr_call_to_nonconstexpr_function,
                       pos, symbol_for(callee), ips);
     do_constexpr_fail(result);
@@ -24063,7 +24074,7 @@ the iwp_1st_resume visit destroys the subobjects and undoes that mapping.
        definition, so this also prevents the interpretation of a function that
        is not fully parsed (e.g., requested due to a recursive call in a
        constexpr function). */
-    if (!callee_scope->is_constexpr_routine) {
+    if (!callee_scope->is_constexpr_routine && !eval_all_routines()) {
       do_constexpr_fail(result);
       info_with_pos_sym(ec_constexpr_call_not_interpretable, pos,
                         symbol_for(callee), ips);
