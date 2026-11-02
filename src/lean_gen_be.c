@@ -85,6 +85,7 @@ messages go to standard error and the program exits with status 1.
 #include "il.h"
 #include "types.h"
 #include "const_ints.h"
+#include "lexical.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1569,6 +1570,24 @@ static void dump_fields_flat(Str *s, a_constant_ptr c, a_type_ptr t, int *first)
   free(val);
 }
 
+/* A string constant (the bytes of a string literal, or of a char array), without its trailing null, as a JSON string. */
+static void dump_string_constant(Str *s, a_constant_ptr sc)
+{
+  unsigned long n = (unsigned long)sc->variant.string.length;
+  const unsigned char *v = (const unsigned char *)sc->variant.string.value;
+  if (n > 0 && v[n - 1] == 0) n--;
+  s_add(s, "\"");
+  for (unsigned long i = 0; i < n; i++) {
+    unsigned char c = v[i];
+    if (c == '"' || c == '\\') s_add(s, "\\%c", c);
+    else if (c == '\n') s_add(s, "\\n");
+    else if (c == '\t') s_add(s, "\\t");
+    else if (c < 0x20 || c >= 0x7f) s_add(s, "\\u%04x", c);
+    else s_add(s, "%c", c);
+  }  /* for */
+  s_add(s, "\"");
+}
+
 static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
 {
   a_type_ptr t = skip_typerefs(type);
@@ -1610,9 +1629,18 @@ static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
         s_add(s, "}");
         return;
       }  /* if */
+      if (cp->variant.address.kind == abk_constant &&
+          cp->variant.address.variant.constant != NULL &&
+          cp->variant.address.variant.constant->kind == ck_string) {
+        dump_string_constant(s, cp->variant.address.variant.constant);
+        return;
+      }  /* if */
       s_add(s, "null");
       return;
     }
+    case ck_string:
+      dump_string_constant(s, cp);
+      return;
     case ck_aggregate: {
       /* The constants in order, with ck_designator entries that move the
          current field or element, and ck_init_repeat entries. */
@@ -1712,6 +1740,40 @@ static void dump_layout(const char *name)
   s_add(&s, "{");
   dump_layout_scope(&s, il_header.primary_scope, "", &first);
   s_add(&s, "\n}\n");
+  write_file(name, &s);
+}
+
+/* EDG_COMMENTS_OUT: the // comments of the translation unit, in source order, as JSON
+   [{"file": ..., "line": n, "text": ...}, ...] (the lexer records them when the variable is set). */
+static void json_string(Str *s, const char *t)
+{
+  s_add(s, "\"");
+  for (; *t != '\0'; t++) {
+    unsigned char c = (unsigned char)*t;
+    if (c == '"' || c == '\\') s_add(s, "\\%c", c);
+    else if (c == '\t') s_add(s, "\\t");
+    else if (c < 0x20) s_add(s, "\\u%04x", c);
+    else s_add(s, "%c", c);
+  }  /* for */
+  s_add(s, "\"");
+}
+
+static void dump_comments(const char *name)
+{
+  Str s = {NULL, 0, 0};
+  unsigned long n = recorded_comment_count();
+  s_add(&s, "[");
+  for (unsigned long i = 0; i < n; i++) {
+    const char *file, *text;
+    unsigned long line;
+    recorded_comment(i, &file, &line, &text);
+    s_add(&s, "%s\n  {\"file\": ", i == 0 ? "" : ",");
+    json_string(&s, file);
+    s_add(&s, ", \"line\": %lu, \"text\": ", line);
+    json_string(&s, text);
+    s_add(&s, "}");
+  }  /* for */
+  s_add(&s, "\n]\n");
   write_file(name, &s);
 }
 
@@ -1861,6 +1923,9 @@ translation unit has been processed.  The IL is not lowered.
     free_all_bufs();
     return;
   }  /* if */
+
+  const char *comments_name = getenv("EDG_COMMENTS_OUT");
+  if (comments_name != NULL && comments_name[0] != '\0') dump_comments(comments_name);
 
   if (data_name != NULL && data_name[0] != '\0') {
     /* Data only (see dump_data); no Lean output unless EDG_LEAN_OUT is set. */

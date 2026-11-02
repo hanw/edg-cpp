@@ -10434,6 +10434,66 @@ below).
 STATIC_THREAD a_boolean
                 in_pcc_mode_half_comment;
 
+/* ---- Recording of // comments (EDG_COMMENTS_OUT). ---- */
+typedef struct a_recorded_comment {
+  char               *file;
+  unsigned long      line;
+  char               *text;
+} a_recorded_comment;
+static a_recorded_comment *recorded_comments = NULL;
+static unsigned long       n_recorded_comments = 0, cap_recorded_comments = 0;
+
+static a_boolean comments_are_recorded(void)
+{
+  static int state = -1;
+  if (state < 0) state = getenv("EDG_COMMENTS_OUT") != NULL;
+  return state ? TRUE : FALSE;
+}  /* comments_are_recorded */
+
+static void record_comment(const a_source_position *pos, a_const_char *from,
+                           a_const_char *to)
+{
+  unsigned long n = 0, i;
+  char *t;
+  a_const_char *c;
+  if (n_recorded_comments == cap_recorded_comments) {
+    cap_recorded_comments = cap_recorded_comments != 0 ? 2 * cap_recorded_comments : 256;
+    recorded_comments = (a_recorded_comment *)realloc(recorded_comments,
+                          cap_recorded_comments * sizeof(a_recorded_comment));
+    if (recorded_comments == NULL) exit(1);
+  }  /* if */
+  for (c = from + 2; c < to; c++) if (*c != LE_ESCAPE) n++;
+  t = (char *)malloc(n + 1);
+  if (t == NULL) exit(1);
+  for (i = 0, c = from + 2; c < to; c++) if (*c != LE_ESCAPE) t[i++] = (char)*c;
+  t[i] = '\0';
+  {
+    a_const_char  *file_name = "?";
+    a_const_char  *full_name = NULL;
+    a_line_number  line = 0;
+    a_boolean      at_end = FALSE;
+    const char     *f;
+    if (pos->seq != 0)
+      (void)conv_seq_to_file_and_line(pos->seq, &file_name, &full_name, &line, &at_end);
+    f = full_name != NULL ? full_name : file_name;
+    recorded_comments[n_recorded_comments].file = (char *)malloc(strlen(f) + 1);
+    if (recorded_comments[n_recorded_comments].file == NULL) exit(1);
+    strcpy(recorded_comments[n_recorded_comments].file, f);
+    recorded_comments[n_recorded_comments].line = (unsigned long)line;
+  }
+  recorded_comments[n_recorded_comments].text = t;
+  n_recorded_comments++;
+}  /* record_comment */
+
+unsigned long recorded_comment_count(void) { return n_recorded_comments; }
+
+void recorded_comment(unsigned long i, const char **file, unsigned long *line, const char **text)
+{
+  *file = recorded_comments[i].file;
+  *line = recorded_comments[i].line;
+  *text = recorded_comments[i].text;
+}  /* recorded_comment */
+
 static void skip_pcc_mode_half_comment(void)
 /*
 In pcc mode, a comment can be begun by "/" followed by "*" as a result
@@ -11636,6 +11696,12 @@ end_of_current_line:
 #endif /* MICROSOFT_EXTENSIONS_ALLOWED */
         /* Do not insert code here; this is the "then" of an "if". */
         {        
+          if (comments_are_recorded() && !in_preprocessing_directive) {
+            /* The position of this comment (not the one that
+               determine_comment_pos_if_not_yet_done may have cached). */
+            macro_line_loc_to_source_pos(comment_start_loc, comment_start_pos);
+            record_comment(&comment_start_pos, comment_start_loc, curr_char_loc);
+          }  /* if */
           if (need_to_delete_comment()) {
 #if INCLUDE_COMMENTS_IN_ASM_FUNC_BODY
             /* Before deleting the comment, see if it's part of an asm function

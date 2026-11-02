@@ -12012,6 +12012,12 @@ tok_underlying_type.
 }  /* is_type_returning_type_trait */
 
 
+/* The // comments the lexer has skipped, when EDG_COMMENTS_OUT is set in the
+   environment (used by the Lean back end to write them as data): count, and
+   the file, the line and the text (without the //) of comment i. */
+unsigned long recorded_comment_count(void);
+void recorded_comment(unsigned long i, const char **file, unsigned long *line, const char **text);
+
 /* Conditionally close the "edg" namespace. */
 END_EDG_NAMESPACE
 
