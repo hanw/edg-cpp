@@ -1438,6 +1438,55 @@ static void dump_zero(Str *s, a_type_ptr type)
   }  /* if */
 }
 
+/* The first `limit` elements of the array constant whose entries start at c (type t). */
+static void dump_array(Str *s, a_constant_ptr c, a_type_ptr t, unsigned long limit)
+{
+  a_type_ptr et = t->variant.array.element_type;
+  unsigned long n = (unsigned long)t->variant.array.variant.number_of_elements;
+  unsigned long i = 0;
+  a_constant_ptr *val = (a_constant_ptr *)calloc((size_t)n + 1,
+                                                 sizeof(a_constant_ptr));
+  if (val == NULL) out_of_memory();
+  for (; c != NULL; c = c->next) {
+    if (c->kind == ck_designator) {
+      i = (unsigned long)c->variant.designator.variant.array_element;
+    } else if (c->kind == ck_init_repeat) {
+      for (unsigned long r = 0;
+           r < (unsigned long)c->variant.init_repeat.count && i < n;
+           r++, i++) {
+        val[i] = c->variant.init_repeat.constant;
+      }  /* for */
+    } else {
+      if (i < n) val[i] = c;
+      i++;
+    }  /* if */
+  }  /* for */
+  s_add(s, "[");
+  for (i = 0; i < n && i < limit; i++) {
+    if (i != 0) s_add(s, ", ");
+    if (val[i] != NULL) dump_constant(s, val[i], et);
+    else dump_zero(s, et);
+  }  /* for */
+  s_add(s, "]");
+  free(val);
+}
+
+/* The std::vector of the cpp-lean stub (src/gen/stub/vector): a class named
+   vector with exactly two fields, an array a and a count n.  It is written as
+   the list of its first n elements, not as the whole array. */
+static a_boolean is_stub_vector(a_type_ptr t)
+{
+  a_field_ptr f = t->variant.class_struct_union.field_list;
+  if (t->source_corresp.name == NULL ||
+      strcmp(t->source_corresp.name, "vector") != 0) return FALSE;
+  if (f == NULL || f->source_corresp.name == NULL ||
+      strcmp(f->source_corresp.name, "a") != 0 ||
+      skip_typerefs(f->type)->kind != tk_array) return FALSE;
+  f = f->next;
+  return f != NULL && f->source_corresp.name != NULL &&
+         strcmp(f->source_corresp.name, "n") == 0 && f->next == NULL;
+}
+
 static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
 {
   a_type_ptr t = skip_typerefs(type);
@@ -1450,6 +1499,36 @@ static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
         s_add(s, "%llu",
               (unsigned long long)unsigned_value_of_integer_constant(cp, &ovflo));
       }  /* if */
+      return;
+    }
+    case ck_address: {
+      /* A pointer into a static object: the variable and the path of
+         subobjects (field names and element offsets) from it. */
+      if (cp->variant.address.kind == abk_variable &&
+          cp->variant.address.variant.variable != NULL &&
+          cp->variant.address.variant.variable->source_corresp.name != NULL) {
+        s_add(s, "{\"&\": \"%s\", \"path\": [",
+              cp->variant.address.variant.variable->source_corresp.name);
+        int first = 1;
+        for (a_subobject_path_ptr sp = cp->variant.address.subobject_path;
+             sp != NULL; sp = sp->next) {
+          if (!first) s_add(s, ", ");
+          first = 0;
+          if (sp->is_offset)
+            s_add(s, "%lld", (long long)sp->variant.ptr_offset);
+          else if (sp->is_base_class)
+            s_add(s, "\"<base>\"");
+          else
+            s_add(s, "\"%s\"", sp->variant.field->source_corresp.name != NULL ?
+                                  sp->variant.field->source_corresp.name : "?");
+        }  /* for */
+        s_add(s, "]");
+        if (cp->variant.address.offset != 0 && cp->variant.address.subobject_path == NULL)
+          s_add(s, ", \"off\": %lld", (long long)cp->variant.address.offset);
+        s_add(s, "}");
+        return;
+      }  /* if */
+      s_add(s, "null");
       return;
     }
     case ck_aggregate: {
@@ -1474,6 +1553,20 @@ static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
           k++;
           if (f != NULL) f = f->next;
         }  /* for */
+        if (is_stub_vector(t)) {
+          unsigned long cnt = 0;
+          if (val[1] != NULL && val[1]->kind == ck_integer) {
+            a_boolean ovflo = FALSE;
+            cnt = (unsigned long)unsigned_value_of_integer_constant(val[1], &ovflo);
+          }  /* if */
+          if (val[0] != NULL && val[0]->kind == ck_aggregate)
+            dump_array(s, val[0]->variant.aggregate.first_constant,
+                       skip_typerefs(t->variant.class_struct_union.field_list->type), cnt);
+          else
+            s_add(s, "[]");
+          free(val);
+          return;
+        }  /* if */
         s_add(s, "{");
         k = 0;
         for (f = t->variant.class_struct_union.field_list; f != NULL;
@@ -1488,34 +1581,7 @@ static void dump_constant(Str *s, a_constant_ptr cp, a_type_ptr type)
         return;
       }  /* if */
       if (t->kind == tk_array) {
-        a_type_ptr et = t->variant.array.element_type;
-        unsigned long n = (unsigned long)t->variant.array.variant.number_of_elements;
-        unsigned long i = 0;
-        a_constant_ptr *val = (a_constant_ptr *)calloc((size_t)n + 1,
-                                                       sizeof(a_constant_ptr));
-        if (val == NULL) out_of_memory();
-        for (; c != NULL; c = c->next) {
-          if (c->kind == ck_designator) {
-            i = (unsigned long)c->variant.designator.variant.array_element;
-          } else if (c->kind == ck_init_repeat) {
-            for (unsigned long r = 0;
-                 r < (unsigned long)c->variant.init_repeat.count && i < n;
-                 r++, i++) {
-              val[i] = c->variant.init_repeat.constant;
-            }  /* for */
-          } else {
-            if (i < n) val[i] = c;
-            i++;
-          }  /* if */
-        }  /* for */
-        s_add(s, "[");
-        for (i = 0; i < n; i++) {
-          if (i != 0) s_add(s, ", ");
-          if (val[i] != NULL) dump_constant(s, val[i], et);
-          else dump_zero(s, et);
-        }  /* for */
-        s_add(s, "]");
-        free(val);
+        dump_array(s, c, t, (unsigned long)t->variant.array.variant.number_of_elements);
         return;
       }  /* if */
       break;
