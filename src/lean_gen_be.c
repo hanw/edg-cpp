@@ -853,6 +853,25 @@ static char *tr_operation(an_expr_node_ptr e)
   return fmt("?");
 }
 
+/* TRUE if expression e calls a function: a constant the front end folded
+   from such an expression (for example "f(N) && g(M)" of constexpr calls)
+   must be translated as the expression, so that Lean evaluates the calls
+   and checks the value, not the front end. */
+static int has_call(an_expr_node_ptr e)
+{
+  an_expr_node_ptr a;
+  if (e == NULL) return 0;
+  if (e->kind == enk_constant)
+    return e->variant.constant.ptr->expr != NULL &&
+           (e->variant.constant.ptr->is_result_of_constexpr_call ||
+            has_call(e->variant.constant.ptr->expr));
+  if (e->kind != enk_operation) return 0;
+  if (e->variant.operation.kind == eok_call) return 1;
+  for (a = e->variant.operation.operands; a != NULL; a = a->next)
+    if (has_call(a)) return 1;
+  return 0;
+}  /* has_call */
+
 static char *tr_expr(an_expr_node_ptr e)
 {
   if (e == NULL) {
@@ -867,8 +886,9 @@ static char *tr_expr(an_expr_node_ptr e)
          evaluated (for example a law with no parameters): translate the
          call, not its value, so that Lean does the evaluation and checks
          it (also for u32 and struct results). */
-      if (e->variant.constant.ptr->is_result_of_constexpr_call &&
-          e->variant.constant.ptr->expr != NULL) {
+      if (e->variant.constant.ptr->expr != NULL &&
+          (e->variant.constant.ptr->is_result_of_constexpr_call ||
+           has_call(e->variant.constant.ptr->expr))) {
         return tr_expr(e->variant.constant.ptr->expr);
       }  /* if */
       return tr_constant(e->variant.constant.ptr, &e->position);
