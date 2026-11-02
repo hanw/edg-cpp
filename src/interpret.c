@@ -9525,7 +9525,7 @@ loop body push a work item for it and continue in a later phase.
          local variables are only permitted in C++23 mode and only if they can
          be used as constant expressions. */
       if (stmt->variant.decl.has_static_or_thread_variable &&
-          !(local_static_constexpr_enabled &&
+          !((local_static_constexpr_enabled || eval_all_routines()) &&
             decl_stmt_only_has_known_constant_variables(stmt))) {
         info_with_pos(ec_constexpr_local_static, &stmt->position, ips);
         do_constexpr_fail(result);
@@ -32318,6 +32318,20 @@ the value representation of the integer value.
           }  /* if */
         } else {
           /* A variable used as a glvalue; the result is its address. */
+          if (var_bytes == NULL && eval_all_routines() &&
+              var->init_kind == initk_static && var->initializer.constant != NULL) {
+            /* EDG_EVAL_ALL: a statically initialized variable that is not
+               const (a table that a header defines): give it interpreter
+               storage with its initial value, so a pointer to it can be read
+               through. */
+            a_constexpr_address dst_addr;
+            alloc_static_object(ips, tp, var_bytes, &result);
+            if (!result) break;
+            map_stack_bytes(ips, var, var_bytes);
+            clear_address(&dst_addr, var_bytes);
+            result = extract_value_from_constant(ips, var->initializer.constant, dst_addr);
+            if (!result) break;
+          }  /* if */
           if (var_bytes == NULL && var->is_immutable &&
               gcc_const_variables_allowed && var->storage_class == sc_static &&
               (clangc_version_is(>=170000) || gcc_version_is(>=80000))) {
